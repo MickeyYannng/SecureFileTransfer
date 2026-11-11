@@ -23,7 +23,7 @@ flowchart LR
     GW --> AUDIT[结构化审计日志]
 ```
 
-目前只落地 UI、连接管理、共享控制协议、WebSocket 网关的最小校验与心跳。图中其余模块是后续阶段的明确边界。
+Phase 2.1 已落地 UI、连接管理、共享控制协议、WebSocket 网关、认证/会话、SQLite 用户元数据和受限文件列表。传输任务管理、文件内容读写和 TLS 仍是后续阶段边界。
 
 ## 3. 运行时与目录边界
 
@@ -114,4 +114,12 @@ sequenceDiagram
 ## 8. 配置与秘密管理
 
 `.env.example` 只含非秘密默认值。真实 `.env`、数据库、存储内容、证书和私钥全部被 `.gitignore` 排除。Phase 3 将提供开发 CA/证书生成说明，但绝不提交私钥；生产从环境或秘密管理设施加载密钥，并拒绝缺少 TLS 的生产启动。
+
+## 9. Phase 2.1 持久化与隔离实现
+
+- SQLite 使用静态 SQL migration 和 Node.js 22.5+ 内置 `node:sqlite`；动态值全部通过 prepared statement 参数绑定。Node 22 会显示 SQLite experimental warning，这是已知运行时提示，不影响当前验证，升级 Node LTS 时应复核 API 稳定性。
+- `users` 保存 Argon2id PHC 哈希、公开用户资料和配额；`sessions` 保存随机 Token 的 SHA-256 查找值、有效期和撤销时间，不保存原始 Token。
+- 服务端连接只保存内部 `sessionId`。任何受保护操作都重新读取数据库，因而退出、过期或后台撤销会立即生效。
+- 存储布局为 `storage/users/<server-issued-uuid>/`。路径接口只接受 `/` 分隔的逻辑相对路径，拒绝绝对路径、反斜杠、`.`、`..`、NUL、Windows 保留名及符号链接/目录联接。
+- Phase 2.1 仅列举目录和计算配额用量；`resolveForCreate` 为 Phase 2.2 预留安全创建目标解析，但尚未开放上传入口。
 

@@ -16,6 +16,12 @@
 
 ## Phase 2：认证与基本文件传输
 
+### Phase 2.1：认证、会话和目录隔离（已实现）
+
+已完成 SQLite migration、Argon2id、Alice/Bob 初始化入口、可过期/撤销的随机会话、WebSocket 重认证、当前用户、退出、私人目录与安全文件列表框架。未认证/过期/撤销连接不能访问文件请求；路径越界和链接逃逸由实际接口测试覆盖。详见 `docs/phase-2.1.md`。
+
+### Phase 2.2：基本文件内容传输（下一步）
+
 范围：
 
 - SQLite schema/migration；用户注册种子或管理员建用户；Argon2id 密码验证和短寿命会话。

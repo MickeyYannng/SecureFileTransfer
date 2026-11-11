@@ -1,6 +1,6 @@
 # SFTP-WS v1 应用层协议草案
 
-状态：**Draft / Phase 1 subset implemented**。名称 `SFTP-WS` 仅为本实验协议名，不应与 SSH File Transfer Protocol（通常也缩写 SFTP）混淆；最终报告可改用更不易混淆的 `UCAS-SFT/1`。
+状态：**Draft / Phase 2.1 authentication subset implemented**。名称 `SFTP-WS` 仅为本实验协议名，不应与 SSH File Transfer Protocol（通常也缩写 SFTP）混淆；最终报告可改用更不易混淆的 `UCAS-SFT/1`。
 
 ## 1. 设计目标
 
@@ -40,7 +40,57 @@ WebSocket 每条 message 对应一个 `SFTP-WS` frame，不允许一个协议 fr
 
 Phase 1 已实现：`HELLO`、`HELLO_ACK`、`HEARTBEAT_PING`、`HEARTBEAT_PONG`、`ERROR`。
 
-Phase 2/3 计划增加：`AUTH_REQUEST/RESULT`、`LIST_REQUEST/RESULT`、`UPLOAD_INIT/ACCEPT`、`DOWNLOAD_INIT/ACCEPT`、`CHUNK_ACK`、`TRANSFER_FINISH/COMPLETE/CANCEL`。
+Phase 2.1 已增加：`AUTH_LOGIN`、`AUTH_TOKEN`、`AUTH_SUCCESS`、`AUTH_LOGOUT/ACK`、`AUTH_ME/RESULT`、`FILE_LIST_REQUEST/RESULT`。文件列表是受保护的控制请求，不是文件内容传输。
+
+Phase 2.2/3 计划增加：`UPLOAD_INIT/ACCEPT`、`DOWNLOAD_INIT/ACCEPT`、`CHUNK_ACK`、`TRANSFER_FINISH/COMPLETE/CANCEL`。
+
+### 3.1 认证状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> Connected: WebSocket open
+    Connected --> Negotiated: HELLO / HELLO_ACK
+    Negotiated --> Authenticated: AUTH_LOGIN(valid credentials)
+    Negotiated --> Authenticated: AUTH_TOKEN(valid, unexpired, unrevoked token)
+    Negotiated --> Negotiated: authentication ERROR
+    Authenticated --> Authenticated: AUTH_ME / FILE_LIST_REQUEST
+    Authenticated --> Negotiated: AUTH_LOGOUT (revoke session)
+    Authenticated --> Negotiated: session expires or is revoked
+    Negotiated --> [*]: connection close
+    Authenticated --> [*]: connection close
+```
+
+- 客户端不能提供或选择 `userId`；服务端从参数化查询得到用户，再把 `sessionId` 绑定到连接状态。
+- 原始 256 位随机 Token 只返回一次，数据库只保存 Token 的 SHA-256 查找值；密码只保存 Argon2id PHC 字符串。
+- 每次 `AUTH_ME`、`FILE_LIST_REQUEST` 及未来文件操作都重新从 SQLite 检查会话有效期和撤销状态，不只检查连接内布尔值。
+- 断线不会自动撤销 Token，以支持短期重连；新 WebSocket 完成 HELLO 后必须发送 `AUTH_TOKEN` 重新验证。
+- `AUTH_LOGOUT` 撤销数据库会话并把连接退回未认证状态。
+
+### 3.2 登录、重连和退出时序
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as WebSocket Server
+    participant DB as SQLite
+    C->>S: HELLO
+    S-->>C: HELLO_ACK
+    C->>S: AUTH_LOGIN(username, password)
+    S->>DB: parameterized user lookup
+    S->>S: Argon2id verify
+    S->>DB: store hash(token), expiry, revoked=NULL
+    S-->>C: AUTH_SUCCESS(raw token once, public user)
+    C->>S: FILE_LIST_REQUEST(path only, no userId)
+    S->>DB: validate bound session
+    S-->>C: FILE_LIST_RESULT(private directory only)
+    Note over C,S: after network reconnect
+    C->>S: HELLO, then AUTH_TOKEN
+    S->>DB: validate token hash, expiry, revocation
+    S-->>C: AUTH_SUCCESS(no new token)
+    C->>S: AUTH_LOGOUT
+    S->>DB: set revoked_at
+    S-->>C: AUTH_LOGOUT_ACK
+```
 
 ## 4. 二进制数据帧固定头（网络字节序，大端）
 

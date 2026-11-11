@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type Server as HttpServer } from "node:http";
+import { fileURLToPath } from "node:url";
 import express from "express";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import {
+  ERROR_CODES,
   MAX_CONTROL_MESSAGE_BYTES,
   PROTOCOL_NAME,
   PROTOCOL_VERSION,
@@ -10,26 +12,48 @@ import {
   hasStringField,
   parseControlMessage,
   serializeControlMessage,
+  type AuthMeResultPayload,
+  type AuthSuccessPayload,
   type ControlMessage,
   type ErrorPayload,
   type HeartbeatPayload,
   type HelloAckPayload,
 } from "@sft/protocol";
+import { AuthFailure, AuthService, type AuthenticatedSession } from "./auth.js";
+import { AppDatabase } from "./database.js";
+import { StorageFailure, StorageService } from "./storage.js";
+
+export interface InitialUser {
+  id?: string;
+  username: string;
+  password: string;
+  displayName: string;
+}
 
 export interface ServerOptions {
   host?: string;
   port?: number;
   heartbeatIntervalMs?: number;
   heartbeatTimeoutMs?: number;
+  databasePath?: string;
+  storageRoot?: string;
+  sessionTtlMs?: number;
+  maxFileSizeBytes?: number;
+  defaultQuotaBytes?: number;
+  defaultMaxFiles?: number;
+  initialUsers?: InitialUser[];
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
 
 interface ConnectionState {
   connectionId: string;
   helloComplete: boolean;
+  sessionId?: string;
   lastPongAt: number;
+  pendingHeartbeatNonce?: string;
   messagesInWindow: number;
   rateWindowStartedAt: number;
+  messageChain: Promise<void>;
 }
 
 export interface RunningServer {
@@ -41,22 +65,42 @@ export interface RunningServer {
 
 const CONTROL_RATE_WINDOW_MS = 10_000;
 const CONTROL_RATE_LIMIT = 100;
+const defaultDatabasePath = fileURLToPath(new URL("../../../data/sft.sqlite", import.meta.url));
+const defaultStorageRoot = fileURLToPath(new URL("../../../storage", import.meta.url));
 
 export async function startServer(options: ServerOptions = {}): Promise<RunningServer> {
   const host = options.host ?? "127.0.0.1";
   const port = options.port ?? 3000;
   const heartbeatIntervalMs = options.heartbeatIntervalMs ?? 15_000;
   const heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? 45_000;
+  const sessionTtlMs = options.sessionTtlMs ?? 30 * 60_000;
+  const maxFileSizeBytes = options.maxFileSizeBytes ?? 512 * 1024 * 1024;
+  const defaultQuotaBytes = options.defaultQuotaBytes ?? 1024 * 1024 * 1024;
+  const defaultMaxFiles = options.defaultMaxFiles ?? 1_000;
   const logger = options.logger ?? console;
 
   if (heartbeatIntervalMs <= 0 || heartbeatTimeoutMs <= heartbeatIntervalMs) {
     throw new Error("heartbeat timeout must be greater than the positive interval");
   }
+  if (sessionTtlMs <= 0) throw new Error("session TTL must be positive");
+
+  const database = new AppDatabase(options.databasePath ?? defaultDatabasePath);
+  const auth = await AuthService.create(database, { sessionTtlMs, defaultQuotaBytes, defaultMaxFiles });
+  const storage = new StorageService(options.storageRoot ?? defaultStorageRoot, {
+    maxFileSizeBytes,
+    defaultQuotaBytes,
+    defaultMaxFiles,
+  });
+  await storage.initialize();
+  for (const initialUser of options.initialUsers ?? []) {
+    const result = await auth.createUser(initialUser);
+    await storage.ensureUserRoot(result.user.id);
+  }
 
   const app = express();
   app.disable("x-powered-by");
   app.get("/health", (_request, response) => {
-    response.json({ status: "ok", protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION });
+    response.json({ status: "ok", protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, phase: "2.1" });
   });
 
   const httpServer = createServer(app);
@@ -66,7 +110,7 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
     maxPayload: MAX_CONTROL_MESSAGE_BYTES,
     perMessageDeflate: false,
   });
-
+  webSocketServer.on("error", () => logger.error("WebSocket server transport error"));
   const states = new WeakMap<WebSocket, ConnectionState>();
 
   webSocketServer.on("connection", (socket) => {
@@ -77,69 +121,28 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
       lastPongAt: now,
       messagesInWindow: 0,
       rateWindowStartedAt: now,
+      messageChain: Promise.resolve(),
     };
     states.set(socket, state);
 
     socket.on("message", (data, isBinary) => {
-      if (!allowControlMessage(state)) {
-        sendError(socket, randomUUID(), "RATE_LIMITED", "too many control messages", true);
-        socket.close(1008, "rate limit exceeded");
-        return;
-      }
-      if (isBinary) {
-        sendError(socket, randomUUID(), "NOT_IMPLEMENTED", "binary transfer frames begin in Phase 2", false);
-        return;
-      }
-
-      let message: ControlMessage<unknown>;
-      try {
-        message = parseControlMessage(rawDataToUtf8(data));
-      } catch (error) {
-        sendError(socket, randomUUID(), "INVALID_MESSAGE", errorMessage(error), false);
-        return;
-      }
-
-      if (!state.helloComplete && message.type !== "HELLO") {
-        sendError(socket, message.requestId, "HELLO_REQUIRED", "HELLO must be the first message", false);
-        return;
-      }
-
-      switch (message.type) {
-        case "HELLO": {
-          if (!hasStringField(message.payload, "protocol") || message.payload.protocol !== PROTOCOL_NAME) {
-            sendError(socket, message.requestId, "PROTOCOL_MISMATCH", "unsupported protocol name", false);
-            socket.close(1002, "protocol mismatch");
-            return;
-          }
-          state.helloComplete = true;
-          const payload: HelloAckPayload = {
-            protocol: PROTOCOL_NAME,
-            connectionId: state.connectionId,
-            heartbeatIntervalMs,
-            heartbeatTimeoutMs,
-          };
-          send(socket, createControlMessage("HELLO_ACK", message.requestId, payload));
-          break;
-        }
-        case "HEARTBEAT_PING": {
-          if (!hasStringField(message.payload, "nonce")) {
-            sendError(socket, message.requestId, "INVALID_PAYLOAD", "heartbeat nonce is required", false);
-            return;
-          }
-          send(socket, createControlMessage("HEARTBEAT_PONG", message.requestId, { nonce: message.payload.nonce }));
-          break;
-        }
-        case "HEARTBEAT_PONG": {
-          if (hasStringField(message.payload, "nonce")) state.lastPongAt = Date.now();
-          break;
-        }
-        case "HELLO_ACK":
-        case "ERROR":
-          sendError(socket, message.requestId, "UNEXPECTED_MESSAGE", `${message.type} is server-originated`, false);
-          break;
-      }
+      state.messageChain = state.messageChain
+        .then(() => handleIncomingMessage(
+          socket,
+          state,
+          data,
+          isBinary,
+          auth,
+          storage,
+          logger,
+          heartbeatIntervalMs,
+          heartbeatTimeoutMs,
+        ))
+        .catch(() => {
+          logger.error(`Unhandled request failure on connection ${state.connectionId}`);
+          sendError(socket, randomUUID(), ERROR_CODES.internalError, "internal server error", false);
+        });
     });
-
     socket.on("error", (error) => logger.warn(`WebSocket ${state.connectionId}: ${error.message}`));
   });
 
@@ -154,23 +157,32 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
         continue;
       }
       if (!state.helloComplete) continue;
-      const payload: HeartbeatPayload = { nonce: randomUUID() };
+      if (state.pendingHeartbeatNonce) continue;
+      const nonce = randomUUID();
+      state.pendingHeartbeatNonce = nonce;
+      const payload: HeartbeatPayload = { nonce };
       send(socket, createControlMessage("HEARTBEAT_PING", randomUUID(), payload));
     }
   }, heartbeatIntervalMs);
   heartbeatTimer.unref();
 
-  await new Promise<void>((resolve, reject) => {
-    httpServer.once("error", reject);
-    httpServer.listen(port, host, () => {
-      httpServer.off("error", reject);
-      resolve();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      httpServer.once("error", reject);
+      httpServer.listen(port, host, () => {
+        httpServer.off("error", reject);
+        resolve();
+      });
     });
-  });
+  } catch (error) {
+    clearInterval(heartbeatTimer);
+    database.close();
+    throw error;
+  }
 
   const address = httpServer.address();
   if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-  logger.info(`SFT Phase 1 server listening on http://${host}:${address.port}`);
+  logger.info(`SFT Phase 2.1 server listening on http://${host}:${address.port}`);
 
   return {
     host,
@@ -178,14 +190,200 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
     httpServer,
     async close() {
       clearInterval(heartbeatTimer);
-      for (const socket of webSocketServer.clients) socket.close(1001, "server shutdown");
+      for (const socket of webSocketServer.clients) socket.terminate();
+      await new Promise<void>((resolve) => webSocketServer.close(() => resolve()));
       await new Promise<void>((resolve, reject) => {
-        webSocketServer.close(() => {
-          httpServer.close((error) => (error ? reject(error) : resolve()));
-        });
+        httpServer.close((error) => (error ? reject(error) : resolve()));
       });
+      database.close();
     },
   };
+}
+
+async function handleIncomingMessage(
+  socket: WebSocket,
+  state: ConnectionState,
+  data: RawData,
+  isBinary: boolean,
+  auth: AuthService,
+  storage: StorageService,
+  logger: Pick<Console, "info" | "warn" | "error">,
+  heartbeatIntervalMs: number,
+  heartbeatTimeoutMs: number,
+): Promise<void> {
+  if (!allowControlMessage(state)) {
+    sendError(socket, randomUUID(), ERROR_CODES.rateLimited, "too many control messages", true);
+    socket.close(1008, "rate limit exceeded");
+    return;
+  }
+  if (isBinary) {
+    sendError(socket, randomUUID(), ERROR_CODES.notImplemented, "binary transfer frames begin in Phase 2.2", false);
+    return;
+  }
+
+  let message: ControlMessage<unknown>;
+  try {
+    message = parseControlMessage(rawDataToUtf8(data));
+  } catch {
+    sendError(socket, randomUUID(), ERROR_CODES.invalidMessage, "invalid control message", false);
+    return;
+  }
+
+  if (!state.helloComplete && message.type !== "HELLO") {
+    sendError(socket, message.requestId, ERROR_CODES.helloRequired, "HELLO must be the first message", false);
+    return;
+  }
+
+  try {
+    switch (message.type) {
+      case "HELLO": {
+        if (state.helloComplete) throw new ProtocolFailure("HELLO has already completed");
+        if (!hasStringField(message.payload, "protocol") || message.payload.protocol !== PROTOCOL_NAME) {
+          sendError(socket, message.requestId, ERROR_CODES.protocolMismatch, "unsupported protocol name", false);
+          socket.close(1002, "protocol mismatch");
+          return;
+        }
+        state.helloComplete = true;
+        const payload: HelloAckPayload = {
+          protocol: PROTOCOL_NAME,
+          connectionId: state.connectionId,
+          heartbeatIntervalMs,
+          heartbeatTimeoutMs,
+        };
+        send(socket, createControlMessage("HELLO_ACK", message.requestId, payload));
+        return;
+      }
+      case "HEARTBEAT_PING": {
+        const nonce = requiredString(message.payload, "nonce", 128);
+        send(socket, createControlMessage("HEARTBEAT_PONG", message.requestId, { nonce }));
+        return;
+      }
+      case "HEARTBEAT_PONG": {
+        const nonce = requiredString(message.payload, "nonce", 128);
+        if (state.pendingHeartbeatNonce === nonce) {
+          state.lastPongAt = Date.now();
+          delete state.pendingHeartbeatNonce;
+        }
+        return;
+      }
+      case "AUTH_LOGIN": {
+        if (state.sessionId) throw new ProtocolFailure("connection is already authenticated");
+        const username = requiredString(message.payload, "username", 128);
+        const password = requiredString(message.payload, "password", 512);
+        const login = await auth.login(username, password);
+        state.sessionId = login.sessionId;
+        await storage.ensureUserRoot(login.user.id);
+        const payload: AuthSuccessPayload = {
+          token: login.token,
+          user: login.user,
+          expiresAt: login.expiresAt,
+        };
+        send(socket, createControlMessage("AUTH_SUCCESS", message.requestId, payload));
+        return;
+      }
+      case "AUTH_TOKEN": {
+        if (state.sessionId) throw new ProtocolFailure("connection is already authenticated");
+        const token = requiredString(message.payload, "token", 256);
+        const session = auth.authenticateToken(token);
+        state.sessionId = session.sessionId;
+        await storage.ensureUserRoot(session.user.id);
+        const payload: AuthSuccessPayload = { user: session.user, expiresAt: session.expiresAt };
+        send(socket, createControlMessage("AUTH_SUCCESS", message.requestId, payload));
+        return;
+      }
+      case "AUTH_ME": {
+        const session = requireCurrentSession(state, auth);
+        const payload: AuthMeResultPayload = { user: session.user, expiresAt: session.expiresAt };
+        send(socket, createControlMessage("AUTH_ME_RESULT", message.requestId, payload));
+        return;
+      }
+      case "AUTH_LOGOUT": {
+        const session = requireCurrentSession(state, auth);
+        auth.logout(session.sessionId);
+        delete state.sessionId;
+        send(socket, createControlMessage("AUTH_LOGOUT_ACK", message.requestId, {}));
+        return;
+      }
+      case "FILE_LIST_REQUEST": {
+        const session = requireCurrentSession(state, auth);
+        const logicalPath = requiredStringAllowEmpty(message.payload, "path", 1024);
+        const result = await storage.list(session.user, logicalPath);
+        send(socket, createControlMessage("FILE_LIST_RESULT", message.requestId, result));
+        return;
+      }
+      case "HELLO_ACK":
+      case "AUTH_SUCCESS":
+      case "AUTH_LOGOUT_ACK":
+      case "AUTH_ME_RESULT":
+      case "FILE_LIST_RESULT":
+      case "ERROR":
+        throw new ProtocolFailure(`${message.type} is server-originated`);
+    }
+  } catch (error) {
+    if (error instanceof AuthFailure) {
+      if (error.code === "SESSION_EXPIRED" || error.code === "SESSION_REVOKED") delete state.sessionId;
+      sendError(socket, message.requestId, authErrorCode(error.code), error.message, false);
+      return;
+    }
+    if (error instanceof StorageFailure) {
+      sendError(socket, message.requestId, storageErrorCode(error.code), error.message, false);
+      return;
+    }
+    if (error instanceof ProtocolFailure) {
+      sendError(socket, message.requestId, ERROR_CODES.invalidPayload, error.message, false);
+      return;
+    }
+    logger.error(`Request ${message.type} failed on connection ${state.connectionId}`);
+    sendError(socket, message.requestId, ERROR_CODES.internalError, "internal server error", false);
+  }
+}
+
+class ProtocolFailure extends Error {}
+
+function requireCurrentSession(state: ConnectionState, auth: AuthService): AuthenticatedSession {
+  return auth.validateSession(state.sessionId);
+}
+
+function requiredString(value: unknown, field: string, maxLength: number): string {
+  const candidate = readStringField(value, field);
+  if (candidate.length < 1 || candidate.length > maxLength) {
+    throw new ProtocolFailure(`${field} is required`);
+  }
+  return candidate;
+}
+
+function requiredStringAllowEmpty(value: unknown, field: string, maxLength: number): string {
+  const candidate = readStringField(value, field);
+  if (candidate.length > maxLength) {
+    throw new ProtocolFailure(`${field} must be a string`);
+  }
+  return candidate;
+}
+
+function readStringField(value: unknown, field: string): string {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ProtocolFailure(`${field} must be a string`);
+  }
+  const candidate = (value as Record<string, unknown>)[field];
+  if (typeof candidate !== "string") throw new ProtocolFailure(`${field} must be a string`);
+  return candidate;
+}
+
+function authErrorCode(code: AuthFailure["code"]): string {
+  switch (code) {
+    case "AUTH_REQUIRED": return ERROR_CODES.authRequired;
+    case "INVALID_CREDENTIALS": return ERROR_CODES.invalidCredentials;
+    case "SESSION_EXPIRED": return ERROR_CODES.sessionExpired;
+    case "SESSION_REVOKED": return ERROR_CODES.sessionRevoked;
+  }
+}
+
+function storageErrorCode(code: StorageFailure["code"]): string {
+  switch (code) {
+    case "INVALID_PATH": return ERROR_CODES.invalidPath;
+    case "NOT_FOUND": return ERROR_CODES.notFound;
+    case "FORBIDDEN": return ERROR_CODES.forbidden;
+  }
 }
 
 function send(socket: WebSocket, message: ControlMessage<unknown>): void {
@@ -218,8 +416,3 @@ function rawDataToUtf8(data: RawData): string {
   if (data instanceof ArrayBuffer) return Buffer.from(data).toString("utf8");
   return data.toString("utf8");
 }
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : "unknown error";
-}
-

@@ -7,6 +7,15 @@ export const CONTROL_MESSAGE_TYPES = [
   "HELLO_ACK",
   "HEARTBEAT_PING",
   "HEARTBEAT_PONG",
+  "AUTH_LOGIN",
+  "AUTH_TOKEN",
+  "AUTH_SUCCESS",
+  "AUTH_LOGOUT",
+  "AUTH_LOGOUT_ACK",
+  "AUTH_ME",
+  "AUTH_ME_RESULT",
+  "FILE_LIST_REQUEST",
+  "FILE_LIST_RESULT",
   "ERROR",
 ] as const;
 
@@ -41,6 +50,78 @@ export interface ErrorPayload {
   message: string;
   retryable: boolean;
 }
+
+export interface PublicUser {
+  id: string;
+  username: string;
+  displayName: string;
+  role: string;
+  quotaBytes: number;
+  maxFiles: number;
+}
+
+export interface AuthLoginPayload {
+  username: string;
+  password: string;
+}
+
+export interface AuthTokenPayload {
+  token: string;
+}
+
+export interface AuthSuccessPayload {
+  user: PublicUser;
+  expiresAt: number;
+  token?: string;
+}
+
+export interface AuthMeResultPayload {
+  user: PublicUser;
+  expiresAt: number;
+}
+
+export interface FileListRequestPayload {
+  path: string;
+}
+
+export interface FileListEntry {
+  name: string;
+  type: "file" | "directory";
+  size: number;
+  modifiedAt: number;
+}
+
+export interface StorageUsage {
+  usedBytes: number;
+  fileCount: number;
+  quotaBytes: number;
+  maxFiles: number;
+  maxFileSizeBytes: number;
+}
+
+export interface FileListResultPayload {
+  path: string;
+  entries: FileListEntry[];
+  usage: StorageUsage;
+}
+
+export const ERROR_CODES = {
+  invalidMessage: "1001_INVALID_MESSAGE",
+  helloRequired: "1002_HELLO_REQUIRED",
+  protocolMismatch: "1003_PROTOCOL_MISMATCH",
+  unexpectedMessage: "1004_UNEXPECTED_MESSAGE",
+  invalidPayload: "1005_INVALID_PAYLOAD",
+  authRequired: "2001_AUTH_REQUIRED",
+  invalidCredentials: "2002_INVALID_CREDENTIALS",
+  forbidden: "2003_FORBIDDEN",
+  sessionExpired: "2004_SESSION_EXPIRED",
+  sessionRevoked: "2005_SESSION_REVOKED",
+  invalidPath: "3001_INVALID_PATH",
+  notFound: "3004_NOT_FOUND",
+  rateLimited: "4001_RATE_LIMITED",
+  internalError: "5001_INTERNAL_ERROR",
+  notImplemented: "5002_NOT_IMPLEMENTED",
+} as const;
 
 const typeSet = new Set<string>(CONTROL_MESSAGE_TYPES);
 
