@@ -90,6 +90,18 @@ export class StorageService {
     return target;
   }
 
+  async resolveForRead(userId: string, logicalPath: string): Promise<string> {
+    const userRoot = await this.ensureUserRoot(userId);
+    const components = parseLogicalPath(logicalPath, false);
+    const target = await this.resolveExistingFromRoot(userRoot, components);
+    const targetStat = await lstat(target);
+    if (targetStat.isSymbolicLink() || !targetStat.isFile()) {
+      throw new StorageFailure("INVALID_PATH", "path is not a regular file");
+    }
+    assertContained(userRoot, target);
+    return target;
+  }
+
   async prepareUploadPaths(userId: string, logicalPath: string, transferId: string): Promise<{
     finalPath: string;
     temporaryPath: string;

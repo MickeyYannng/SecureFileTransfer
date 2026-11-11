@@ -17,6 +17,7 @@ import {
   type AuthMeResultPayload,
   type AuthSuccessPayload,
   type ControlMessage,
+  type DownloadErrorPayload,
   type ErrorPayload,
   type HeartbeatPayload,
   type HelloAckPayload,
@@ -26,6 +27,7 @@ import { AuthFailure, AuthService, type AuthenticatedSession } from "./auth.js";
 import { AppDatabase } from "./database.js";
 import { StorageFailure, StorageService } from "./storage.js";
 import { UploadFailure, UploadManager } from "./upload.js";
+import { DownloadFailure, DownloadManager, type DownloadAction } from "./download.js";
 
 export interface InitialUser {
   id?: string;
@@ -50,6 +52,10 @@ export interface ServerOptions {
   uploadChunkSize?: number;
   maxActiveUploadsGlobal?: number;
   maxActiveUploadsPerUser?: number;
+  downloadChunkSize?: number;
+  downloadAckTimeoutMs?: number;
+  maxActiveDownloadsGlobal?: number;
+  maxActiveDownloadsPerUser?: number;
   initialUsers?: InitialUser[];
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
@@ -91,6 +97,10 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
   const uploadChunkSize = options.uploadChunkSize ?? 256 * 1024;
   const maxActiveUploadsGlobal = options.maxActiveUploadsGlobal ?? 32;
   const maxActiveUploadsPerUser = options.maxActiveUploadsPerUser ?? 1;
+  const downloadChunkSize = options.downloadChunkSize ?? 256 * 1024;
+  const downloadAckTimeoutMs = options.downloadAckTimeoutMs ?? 15_000;
+  const maxActiveDownloadsGlobal = options.maxActiveDownloadsGlobal ?? 32;
+  const maxActiveDownloadsPerUser = options.maxActiveDownloadsPerUser ?? 1;
   const logger = options.logger ?? console;
 
   if (heartbeatIntervalMs <= 0 || heartbeatTimeoutMs <= heartbeatIntervalMs) {
@@ -100,6 +110,10 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
   if (uploadChunkSize < 16 * 1024 || uploadChunkSize > 1024 * 1024) {
     throw new Error("upload chunk size must be between 16 KiB and 1 MiB");
   }
+  if (downloadChunkSize < 16 * 1024 || downloadChunkSize > 1024 * 1024) {
+    throw new Error("download chunk size must be between 16 KiB and 1 MiB");
+  }
+  if (downloadAckTimeoutMs < 10) throw new Error("download ACK timeout must be at least 10 ms");
 
   const database = new AppDatabase(options.databasePath ?? defaultDatabasePath);
   const auth = await AuthService.create(database, { sessionTtlMs, defaultQuotaBytes, defaultMaxFiles });
@@ -114,6 +128,12 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
     maxActiveUploadsGlobal,
     maxActiveUploadsPerUser,
   });
+  const download = new DownloadManager(storage, {
+    chunkSize: downloadChunkSize,
+    ackTimeoutMs: downloadAckTimeoutMs,
+    maxActiveDownloadsGlobal,
+    maxActiveDownloadsPerUser,
+  });
   for (const initialUser of options.initialUsers ?? []) {
     const result = await auth.createUser(initialUser);
     await storage.ensureUserRoot(result.user.id);
@@ -122,14 +142,14 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
   const app = express();
   app.disable("x-powered-by");
   app.get("/health", (_request, response) => {
-    response.json({ status: "ok", protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, phase: "2.2" });
+    response.json({ status: "ok", protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, phase: "2.3" });
   });
 
   const httpServer = createServer(app);
   const webSocketServer = new WebSocketServer({
     server: httpServer,
     path: "/ws",
-    maxPayload: Math.max(MAX_CONTROL_MESSAGE_BYTES, BINARY_HEADER_LENGTH + uploadChunkSize),
+    maxPayload: Math.max(MAX_CONTROL_MESSAGE_BYTES, BINARY_HEADER_LENGTH + uploadChunkSize, BINARY_HEADER_LENGTH + downloadChunkSize),
     perMessageDeflate: false,
   });
   webSocketServer.on("error", () => logger.error("WebSocket server transport error"));
@@ -165,6 +185,7 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
           auth,
           storage,
           upload,
+          download,
           logger,
           heartbeatIntervalMs,
           heartbeatTimeoutMs,
@@ -177,7 +198,10 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
         .finally(() => { state.pendingMessages -= 1; });
     });
     socket.on("error", (error) => logger.warn(`WebSocket ${state.connectionId}: ${error.message}`));
-    socket.on("close", () => { void upload.abortByConnection(state.connectionId); });
+    socket.on("close", () => {
+      void upload.abortByConnection(state.connectionId);
+      void download.abortByConnection(state.connectionId);
+    });
   });
 
   const heartbeatTimer = setInterval(() => {
@@ -216,7 +240,7 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
 
   const address = httpServer.address();
   if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-  logger.info(`SFT Phase 2.2 server listening on http://${host}:${address.port}`);
+  logger.info(`SFT Phase 2.3 server listening on http://${host}:${address.port}`);
 
   return {
     host,
@@ -227,6 +251,7 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
       for (const socket of webSocketServer.clients) {
         const state = states.get(socket);
         if (state) await upload.abortByConnection(state.connectionId);
+        if (state) await download.abortByConnection(state.connectionId);
         socket.terminate();
       }
       await new Promise<void>((resolve) => webSocketServer.close(() => resolve()));
@@ -246,6 +271,7 @@ async function handleIncomingMessage(
   auth: AuthService,
   storage: StorageService,
   upload: UploadManager,
+  download: DownloadManager,
   logger: Pick<Console, "info" | "warn" | "error">,
   heartbeatIntervalMs: number,
   heartbeatTimeoutMs: number,
@@ -255,16 +281,16 @@ async function handleIncomingMessage(
     await handleUploadChunk(socket, state, data, auth, upload, uploadChunkSize);
     return;
   }
-  if (!allowControlMessage(state)) {
-    sendError(socket, randomUUID(), ERROR_CODES.rateLimited, "too many control messages", true);
-    socket.close(1008, "rate limit exceeded");
-    return;
-  }
   let message: ControlMessage<unknown>;
   try {
     message = parseControlMessage(rawDataToUtf8(data));
   } catch {
     sendError(socket, randomUUID(), ERROR_CODES.invalidMessage, "invalid control message", false);
+    return;
+  }
+  if (!isRateLimitExempt(message.type) && !allowControlMessage(state)) {
+    sendError(socket, message.requestId, ERROR_CODES.rateLimited, "too many control messages", true);
+    socket.close(1008, "rate limit exceeded");
     return;
   }
 
@@ -339,6 +365,7 @@ async function handleIncomingMessage(
       case "AUTH_LOGOUT": {
         const session = requireCurrentSession(state, auth);
         await upload.abortByConnection(state.connectionId);
+        await download.abortByConnection(state.connectionId);
         auth.logout(session.sessionId);
         delete state.sessionId;
         send(socket, createControlMessage("AUTH_LOGOUT_ACK", message.requestId, {}));
@@ -353,6 +380,9 @@ async function handleIncomingMessage(
       }
       case "UPLOAD_INIT": {
         const session = requireCurrentSession(state, auth);
+        if (download.getTransferIdForConnection(state.connectionId)) {
+          throw new UploadFailure("TOO_MANY_TASKS", "this connection already has an active transfer");
+        }
         const logicalPath = requiredString(message.payload, "path", 1024);
         const fileSize = requiredNonNegativeInteger(message.payload, "fileSize");
         const fileSha256 = requiredString(message.payload, "fileSha256", 64);
@@ -374,6 +404,54 @@ async function handleIncomingMessage(
         send(socket, createControlMessage("UPLOAD_ABORTED", message.requestId, { transferId }));
         return;
       }
+      case "DOWNLOAD_INIT": {
+        const session = requireCurrentSession(state, auth);
+        if (upload.getTransferIdForConnection(state.connectionId)) {
+          throw new DownloadFailure("TOO_MANY_TASKS", "this connection already has an active transfer");
+        }
+        const logicalPath = requiredString(message.payload, "path", 1024);
+        const ready = await download.initialize(state.connectionId, session.user, logicalPath, (failure) => {
+          sendDownloadError(socket, randomUUID(), downloadErrorCode(failure.code), failure.message, false, failure.transferId);
+        });
+        // Hash preparation may take time for a large file; do not send metadata or bytes
+        // unless the connection-bound session is still valid after that work completes.
+        requireCurrentSession(state, auth);
+        if (socket.readyState !== WebSocket.OPEN) {
+          await download.abortByConnection(state.connectionId);
+          return;
+        }
+        send(socket, createControlMessage("DOWNLOAD_READY", message.requestId, ready));
+        const action = await download.nextAction(state.connectionId, session.user.id, ready.transferId);
+        sendDownloadAction(socket, action);
+        return;
+      }
+      case "DOWNLOAD_ACK": {
+        const session = requireCurrentSession(state, auth);
+        const transferId = requiredString(message.payload, "transferId", 36);
+        const nextOffset = requiredNonNegativeInteger(message.payload, "nextOffset");
+        const action = await download.acknowledge(state.connectionId, session.user.id, transferId, nextOffset);
+        sendDownloadAction(socket, action);
+        return;
+      }
+      case "DOWNLOAD_COMPLETE": {
+        const session = requireCurrentSession(state, auth);
+        const transferId = requiredString(message.payload, "transferId", 36);
+        const success = requiredBoolean(message.payload, "success");
+        const receivedSize = requiredNonNegativeInteger(message.payload, "receivedSize");
+        const fileSha256 = requiredString(message.payload, "fileSha256", 64);
+        const complete = await download.complete(state.connectionId, session.user.id, {
+          transferId, success, receivedSize, fileSha256,
+        });
+        send(socket, createControlMessage("DOWNLOAD_COMPLETE", message.requestId, complete));
+        return;
+      }
+      case "DOWNLOAD_ABORT": {
+        const session = requireCurrentSession(state, auth);
+        const transferId = requiredString(message.payload, "transferId", 36);
+        await download.abort(state.connectionId, session.user.id, transferId);
+        send(socket, createControlMessage("DOWNLOAD_ABORT", message.requestId, { transferId, acknowledged: true }));
+        return;
+      }
       case "HELLO_ACK":
       case "AUTH_SUCCESS":
       case "AUTH_LOGOUT_ACK":
@@ -384,6 +462,9 @@ async function handleIncomingMessage(
       case "UPLOAD_COMPLETE":
       case "UPLOAD_ABORTED":
       case "UPLOAD_ERROR":
+      case "DOWNLOAD_READY":
+      case "DOWNLOAD_FINISH":
+      case "DOWNLOAD_ERROR":
       case "ERROR":
         throw new ProtocolFailure(`${message.type} is server-originated`);
     }
@@ -392,9 +473,12 @@ async function handleIncomingMessage(
       if (error.code === "SESSION_EXPIRED" || error.code === "SESSION_REVOKED") {
         delete state.sessionId;
         await upload.abortByConnection(state.connectionId);
+        await download.abortByConnection(state.connectionId);
       }
       if (isUploadControlType(message.type)) {
         sendUploadError(socket, message.requestId, authErrorCode(error.code), error.message, false, upload.getTransferIdForConnection(state.connectionId));
+      } else if (isDownloadControlType(message.type)) {
+        sendDownloadError(socket, message.requestId, authErrorCode(error.code), error.message, false, download.getTransferIdForConnection(state.connectionId));
       } else {
         sendError(socket, message.requestId, authErrorCode(error.code), error.message, false);
       }
@@ -404,9 +488,15 @@ async function handleIncomingMessage(
       sendUploadError(socket, message.requestId, uploadErrorCode(error.code), error.message, false, error.transferId);
       return;
     }
+    if (error instanceof DownloadFailure) {
+      sendDownloadError(socket, message.requestId, downloadErrorCode(error.code), error.message, false, error.transferId);
+      return;
+    }
     if (error instanceof StorageFailure) {
       if (isUploadControlType(message.type)) {
         sendUploadError(socket, message.requestId, storageErrorCode(error.code), error.message, false, upload.getTransferIdForConnection(state.connectionId));
+      } else if (isDownloadControlType(message.type)) {
+        sendDownloadError(socket, message.requestId, storageErrorCode(error.code), error.message, false, download.getTransferIdForConnection(state.connectionId));
       } else {
         sendError(socket, message.requestId, storageErrorCode(error.code), error.message, false);
       }
@@ -487,6 +577,15 @@ function requiredNonNegativeInteger(value: unknown, field: string): number {
   return candidate;
 }
 
+function requiredBoolean(value: unknown, field: string): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ProtocolFailure(`${field} must be a boolean`);
+  }
+  const candidate = (value as Record<string, unknown>)[field];
+  if (typeof candidate !== "boolean") throw new ProtocolFailure(`${field} must be a boolean`);
+  return candidate;
+}
+
 function readStringField(value: unknown, field: string): string {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new ProtocolFailure(`${field} must be a string`);
@@ -531,8 +630,35 @@ function uploadErrorCode(code: UploadFailure["code"]): string {
   }
 }
 
+function downloadErrorCode(code: DownloadFailure["code"]): string {
+  switch (code) {
+    case "INVALID_ACK": return ERROR_CODES.invalidOffset;
+    case "HASH_MISMATCH": return ERROR_CODES.hashMismatch;
+    case "SOURCE_CHANGED": return ERROR_CODES.sourceChanged;
+    case "FILE_TOO_LARGE": return ERROR_CODES.quotaExceeded;
+    case "TOO_MANY_TASKS": return ERROR_CODES.tooManyTasks;
+    case "DOWNLOAD_NOT_FOUND": return ERROR_CODES.notFound;
+    case "DOWNLOAD_CANCELLED": return ERROR_CODES.downloadCancelled;
+    case "ACK_TIMEOUT": return ERROR_CODES.ackTimeout;
+    case "IO_ERROR": return ERROR_CODES.internalError;
+  }
+}
+
 function isUploadControlType(type: ControlMessage<unknown>["type"]): boolean {
   return type === "UPLOAD_INIT" || type === "UPLOAD_FINISH" || type === "UPLOAD_ABORT";
+}
+
+function isDownloadControlType(type: ControlMessage<unknown>["type"]): boolean {
+  return type === "DOWNLOAD_INIT"
+    || type === "DOWNLOAD_ACK"
+    || type === "DOWNLOAD_COMPLETE"
+    || type === "DOWNLOAD_ABORT";
+}
+
+function sendDownloadAction(socket: WebSocket, action: DownloadAction): void {
+  if (socket.readyState !== WebSocket.OPEN) return;
+  if (action.kind === "chunk") socket.send(action.frame);
+  else send(socket, createControlMessage("DOWNLOAD_FINISH", randomUUID(), action.payload));
 }
 
 function send(socket: WebSocket, message: ControlMessage<unknown>): void {
@@ -564,6 +690,20 @@ function sendUploadError(
   send(socket, createControlMessage("UPLOAD_ERROR", requestId, payload));
 }
 
+function sendDownloadError(
+  socket: WebSocket,
+  requestId: string,
+  code: string,
+  message: string,
+  retryable: boolean,
+  transferId?: string,
+): void {
+  const payload: DownloadErrorPayload = transferId
+    ? { code, message, retryable, transferId }
+    : { code, message, retryable };
+  send(socket, createControlMessage("DOWNLOAD_ERROR", requestId, payload));
+}
+
 function allowControlMessage(state: ConnectionState): boolean {
   const now = Date.now();
   if (now - state.rateWindowStartedAt >= CONTROL_RATE_WINDOW_MS) {
@@ -572,6 +712,11 @@ function allowControlMessage(state: ConnectionState): boolean {
   }
   state.messagesInWindow += 1;
   return state.messagesInWindow <= CONTROL_RATE_LIMIT;
+}
+
+function isRateLimitExempt(type: ControlMessage<unknown>["type"]): boolean {
+  // These messages are strictly paced by one outstanding server challenge/chunk.
+  return type === "HEARTBEAT_PONG" || type === "DOWNLOAD_ACK";
 }
 
 function rawDataToUtf8(data: RawData): string {

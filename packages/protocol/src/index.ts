@@ -3,10 +3,12 @@ export const PROTOCOL_VERSION = 1;
 export const MAX_CONTROL_MESSAGE_BYTES = 64 * 1024;
 export const BINARY_HEADER_LENGTH = 100;
 export const DEFAULT_UPLOAD_CHUNK_SIZE = 256 * 1024;
+export const DEFAULT_DOWNLOAD_CHUNK_SIZE = 256 * 1024;
 export const MAX_BINARY_METADATA_BYTES = 8 * 1024;
 
 export const BINARY_MESSAGE_TYPES = {
   uploadChunk: 0x0201,
+  downloadChunk: 0x0202,
 } as const;
 
 export const BINARY_FLAGS = {
@@ -36,6 +38,13 @@ export const CONTROL_MESSAGE_TYPES = [
   "UPLOAD_ABORT",
   "UPLOAD_ABORTED",
   "UPLOAD_ERROR",
+  "DOWNLOAD_INIT",
+  "DOWNLOAD_READY",
+  "DOWNLOAD_ACK",
+  "DOWNLOAD_FINISH",
+  "DOWNLOAD_COMPLETE",
+  "DOWNLOAD_ABORT",
+  "DOWNLOAD_ERROR",
   "ERROR",
 ] as const;
 
@@ -162,6 +171,48 @@ export interface UploadErrorPayload extends ErrorPayload {
   transferId?: string;
 }
 
+export interface DownloadInitPayload {
+  path: string;
+}
+
+export interface DownloadReadyPayload {
+  transferId: string;
+  path: string;
+  fileName: string;
+  fileSize: number;
+  fileSha256: string;
+  chunkSize: number;
+  nextOffset: number;
+}
+
+export interface DownloadAckPayload {
+  transferId: string;
+  nextOffset: number;
+}
+
+export interface DownloadFinishPayload {
+  transferId: string;
+  fileSize: number;
+  fileSha256: string;
+}
+
+export interface DownloadCompletePayload {
+  transferId: string;
+  success: boolean;
+  receivedSize: number;
+  fileSha256: string;
+  accepted?: boolean;
+}
+
+export interface DownloadAbortPayload {
+  transferId: string;
+  acknowledged?: boolean;
+}
+
+export interface DownloadErrorPayload extends ErrorPayload {
+  transferId?: string;
+}
+
 export interface BinaryFrameHeader {
   messageType: number;
   flags: number;
@@ -200,6 +251,9 @@ export const ERROR_CODES = {
   invalidOffset: "3009_INVALID_OFFSET",
   invalidChunk: "3010_INVALID_CHUNK",
   uploadCancelled: "3011_UPLOAD_CANCELLED",
+  downloadCancelled: "3012_DOWNLOAD_CANCELLED",
+  sourceChanged: "3013_SOURCE_CHANGED",
+  ackTimeout: "3014_ACK_TIMEOUT",
   rateLimited: "4001_RATE_LIMITED",
   quotaExceeded: "4002_QUOTA_EXCEEDED",
   tooManyTasks: "4003_TOO_MANY_TASKS",

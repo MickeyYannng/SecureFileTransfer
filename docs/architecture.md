@@ -1,4 +1,4 @@
-# 系统架构说明（更新至 Phase 2.2）
+# 系统架构说明（更新至 Phase 2.3）
 
 ## 1. 技术选择与结论
 
@@ -23,7 +23,7 @@ flowchart LR
     GW --> AUDIT[结构化审计日志]
 ```
 
-Phase 2.2 已落地 UI、连接管理、共享控制/二进制协议、WebSocket 网关、认证/会话、SQLite 用户元数据、受限文件列表、单文件上传任务管理与流式文件写入。下载和 TLS 仍是后续阶段边界。
+Phase 2.3 已落地 UI、连接管理、共享控制/二进制协议、WebSocket 网关、认证/会话、SQLite 用户元数据、受限文件列表，以及单文件上传和下载状态机。TLS 仍是后续阶段边界。
 
 ## 3. 运行时与目录边界
 
@@ -52,6 +52,7 @@ secure-file-transfer/
 - Phase 2.2 默认每个连接/用户只允许 1 个上传，服务器还有全局任务上限；初始化在进程内互斥区预留字节数、文件数和目标路径，防止并发绕过配额。
 - 客户端只保留一个未确认块，服务器写入并 `fsync` 后才 ACK，天然提供上传背压。
 - 连接断开会取消当前上传、释放预留并删除临时文件；不以断开作为文件结束信号。断点恢复留到 Phase 4。
+- 下载同样默认每个用户/连接 1 个任务，只有一个未确认块；ACK 超时、断线和取消关闭只读句柄。合法下载 ACK 由服务端发送节奏约束，不计入通用控制消息速率，但仍受队列、状态和偏移校验约束。
 
 ## 5. 关键流程
 
@@ -94,6 +95,28 @@ sequenceDiagram
     Note over C,S: WebSocket remains open
 ```
 
+### Phase 2.3 单文件下载流程（已实现）
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    C->>S: DOWNLOAD_INIT(logical path)
+    S->>S: session/path check + safe open + streaming hash
+    S-->>C: DOWNLOAD_READY(transferId, size, hash, chunkSize)
+    loop one outstanding chunk
+        S-->>C: binary DOWNLOAD_CHUNK(100-byte header + payload)
+        C->>C: chunk hash + bounded write
+        C->>S: DOWNLOAD_ACK(nextOffset)
+    end
+    S->>S: sent hash + source identity recheck
+    S-->>C: DOWNLOAD_FINISH(size, hash)
+    C->>C: whole-file size/hash check
+    C->>S: DOWNLOAD_COMPLETE(result)
+    S-->>C: DOWNLOAD_COMPLETE(accepted=true)
+    Note over C,S: only now deliver verified file; WebSocket remains open
+```
+
 ## 6. Web 路线满足性与风险
 
 | 关注点 | 为什么可满足 | 主要风险 | 对策 |
@@ -134,4 +157,13 @@ sequenceDiagram
 - Windows/Unix 均使用同卷硬链接创建最终文件，以原子且不覆盖的方式解决并发同名冲突；成功后删除临时链接，并尽力对目录执行 `fsync`。目标已存在则安全失败。
 - 错误摘要、大小不符、非法块、取消、会话失效或断线都会关闭句柄、删除临时文件并释放配额预留，不会产生可见残缺文件。
 - 配额预留和活跃任务表目前是单进程内状态；若未来部署多个服务实例，必须迁移到共享事务/租约存储后才能保证跨实例一致性。
+
+## 11. Phase 2.3 一致性、背压和浏览器落盘
+
+- 服务端通过受控相对路径解析后打开只读句柄；在 `DOWNLOAD_READY` 前用有界缓冲区计算 SHA-256，并比较散列前后句柄与路径的设备、inode、大小、mtime/ctime。
+- 传输时再次增量计算实际发送内容摘要。最后一块 ACK 后重新比较打开句柄和当前路径身份；删除、替换、截断或修改均产生 `SOURCE_CHANGED`，不会发送成功完成。
+- 默认 256 KiB 且只允许一个未 ACK 块，避免 WebSocket 发送缓冲无限增长。ACK/完成确认有 15 秒默认超时。
+- Edge/Chrome 主路径先流式写入浏览器 OPFS 临时文件，整文件 SHA-256 和服务端确认通过后，再有界流式复制到用户通过 File System Access API 选择的文件；不在 JavaScript 堆中保存完整大文件。
+- 不支持 File System Access API 的浏览器采用显式限制为 32 MiB 的 Blob 兼容路径；更大文件被拒绝并提示使用 Edge/Chrome。这一兼容模式会占用与文件大小相当的内存。
+- 浏览器无法为普通网页提供跨浏览器原子重命名。主路径在校验成功前不向目标写内容，但最终复制失败可能留下空文件或部分目标；界面会报告失败，OPFS 临时文件会清理。
 

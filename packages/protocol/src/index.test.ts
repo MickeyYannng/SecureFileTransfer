@@ -38,6 +38,25 @@ test("encodes and parses the fixed 100-byte upload chunk header", () => {
   assert.deepEqual(parsed.payload, payload);
 });
 
+test("encodes and parses a download chunk with the shared fixed header", () => {
+  const payload = new Uint8Array([0, 1, 2, 253, 254, 255]);
+  const encoded = encodeBinaryFrame({
+    messageType: BINARY_MESSAGE_TYPES.downloadChunk,
+    flags: BINARY_FLAGS.ackRequired,
+    errorCode: 0,
+    requestId: "33333333-3333-4333-8333-333333333333",
+    transferId: "44444444-4444-4444-8444-444444444444",
+    fileSize: 6n,
+    offset: 0n,
+    payloadSha256: hexToBytes("cd".repeat(32)),
+  }, payload);
+  const parsed = parseBinaryFrame(encoded, 256 * 1024);
+  assert.equal(parsed.header.messageType, BINARY_MESSAGE_TYPES.downloadChunk);
+  assert.equal(parsed.header.payloadLength, payload.length);
+  assert.equal(bytesToHex(parsed.header.payloadSha256), "cd".repeat(32));
+  assert.deepEqual(parsed.payload, payload);
+});
+
 test("rejects binary frames with inconsistent lengths", () => {
   const encoded = encodeBinaryFrame({
     messageType: BINARY_MESSAGE_TYPES.uploadChunk,

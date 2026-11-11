@@ -10,6 +10,7 @@ import {
   createControlMessage,
   encodeBinaryFrame,
   hasStringField,
+  parseBinaryFrame,
   parseControlMessage,
   serializeControlMessage,
   type FileListEntry,
@@ -20,6 +21,7 @@ import {
 type ConnectionStatus = "connecting" | "connected" | "disconnected" | "error";
 type AuthStatus = "unauthenticated" | "authenticating" | "authenticated";
 type UploadStatus = "idle" | "hashing" | "initializing" | "uploading" | "verifying" | "cancelling" | "completed" | "cancelled" | "error";
+type DownloadStatus = "idle" | "selecting" | "initializing" | "downloading" | "verifying" | "confirming" | "saving" | "cancelling" | "completed" | "cancelled" | "error";
 
 const connectionStatus = ref<ConnectionStatus>("disconnected");
 const authStatus = ref<AuthStatus>("unauthenticated");
@@ -43,6 +45,25 @@ let uploadChunkSize = 256 * 1024;
 let uploadPersistedOffset = 0;
 let uploadStartedAt = 0;
 let uploadGeneration = 0;
+const downloadStatus = ref<DownloadStatus>("idle");
+const downloadProgress = ref(0);
+const downloadSpeed = ref(0);
+const downloadMessage = ref("点击文件右侧的下载按钮");
+const downloadFileName = ref("");
+const downloadTransferId = ref<string>();
+let downloadFileSize = 0;
+let downloadExpectedOffset = 0;
+let downloadExpectedSha256 = "";
+let downloadStartedAt = 0;
+let downloadHasher: ReturnType<typeof sha256.create> | undefined;
+let downloadGeneration = 0;
+let downloadFinalHandle: FileSystemFileHandle | undefined;
+let downloadTemporaryRoot: FileSystemDirectoryHandle | undefined;
+let downloadTemporaryHandle: FileSystemFileHandle | undefined;
+let downloadTemporaryName = "";
+let downloadTemporaryWritable: FileSystemWritableFileStream | undefined;
+let fallbackDownloadChunks: BlobPart[] = [];
+const FALLBACK_DOWNLOAD_LIMIT = 32 * 1024 * 1024;
 
 let socket: WebSocket | undefined;
 let sessionToken: string | undefined;
@@ -82,6 +103,7 @@ function connect(): void {
   connectionStatus.value = "connecting";
   addLog(`连接 ${wsUrl.value}`);
   socket = new WebSocket(wsUrl.value);
+  socket.binaryType = "arraybuffer";
 
   socket.addEventListener("open", () => {
     reconnectAttempt = 0;
@@ -91,7 +113,7 @@ function connect(): void {
 
   socket.addEventListener("message", (event) => {
     if (typeof event.data !== "string") {
-      addLog("忽略 Phase 2.1 未支持的二进制消息");
+      void handleDownloadBinary(event.data);
       return;
     }
     try {
@@ -105,6 +127,9 @@ function connect(): void {
   socket.addEventListener("close", () => {
     if (["initializing", "uploading", "verifying", "cancelling"].includes(uploadStatus.value)) {
       failUpload("连接中断；Phase 2.2 不支持断点续传，请重新上传");
+    }
+    if (["initializing", "downloading", "verifying", "confirming", "saving", "cancelling"].includes(downloadStatus.value)) {
+      void failDownload("连接中断；Phase 2.3 不支持断点续传，请重新下载");
     }
     connectionStatus.value = "disconnected";
     authStatus.value = sessionToken ? "authenticating" : "unauthenticated";
@@ -224,7 +249,280 @@ function handleMessage(message: ReturnType<typeof parseControlMessage>): void {
     if (code.startsWith("200")) clearAuthentication();
     return;
   }
+  if (message.type === "DOWNLOAD_READY") {
+    const payload = asRecord(message.payload);
+    downloadTransferId.value = readString(payload, "transferId");
+    downloadFileName.value = readString(payload, "fileName");
+    downloadFileSize = readNumber(payload, "fileSize");
+    downloadExpectedSha256 = readString(payload, "fileSha256");
+    downloadExpectedOffset = readNumber(payload, "nextOffset");
+    downloadStartedAt = performance.now();
+    downloadHasher = sha256.create();
+    downloadStatus.value = "downloading";
+    downloadMessage.value = `正在接收 ${downloadFileName.value} · ${formatBytes(downloadFileSize)}`;
+    return;
+  }
+  if (message.type === "DOWNLOAD_FINISH") {
+    void handleDownloadFinish(message.payload);
+    return;
+  }
+  if (message.type === "DOWNLOAD_COMPLETE") {
+    const payload = asRecord(message.payload);
+    if (payload.accepted === true) void deliverVerifiedDownload();
+    return;
+  }
+  if (message.type === "DOWNLOAD_ABORT") {
+    const payload = asRecord(message.payload);
+    if (payload.acknowledged === true) {
+      downloadStatus.value = "cancelled";
+      downloadMessage.value = "下载已取消，临时内容已清理";
+      downloadTransferId.value = undefined;
+      void cleanupDownloadTarget();
+    }
+    return;
+  }
+  if (message.type === "DOWNLOAD_ERROR") {
+    const payload = asRecord(message.payload);
+    const code = readString(payload, "code");
+    void failDownload(`${code}：${readString(payload, "message")}`);
+    if (code.startsWith("200")) clearAuthentication();
+    return;
+  }
   if (message.type === "ERROR") handleServerError(message.payload);
+}
+
+async function startDownload(entry: FileListEntry): Promise<void> {
+  if (entry.type !== "file" || authStatus.value !== "authenticated" || connectionStatus.value !== "connected") return;
+  if (isDownloadActive()) return;
+  resetDownloadState();
+  const generation = ++downloadGeneration;
+  downloadFileName.value = entry.name;
+  downloadStatus.value = "selecting";
+  downloadMessage.value = `${formatBytes(entry.size)} · 请选择本地保存位置`;
+  try {
+    const picker = (window as unknown as {
+      showSaveFilePicker?: (options: { suggestedName: string }) => Promise<FileSystemFileHandle>;
+    }).showSaveFilePicker;
+    const getDirectory = navigator.storage?.getDirectory?.bind(navigator.storage);
+    if (picker && getDirectory) {
+      downloadFinalHandle = await picker({ suggestedName: entry.name });
+      if (generation !== downloadGeneration) return;
+      downloadTemporaryRoot = await getDirectory();
+      downloadTemporaryName = `.sft-${crypto.randomUUID()}.part`;
+      downloadTemporaryHandle = await downloadTemporaryRoot.getFileHandle(downloadTemporaryName, { create: true });
+      downloadTemporaryWritable = await downloadTemporaryHandle.createWritable();
+    } else {
+      if (entry.size > FALLBACK_DOWNLOAD_LIMIT) {
+        throw new Error("当前浏览器不支持流式保存；兼容模式最多下载 32 MiB，请使用最新版 Edge 或 Chrome");
+      }
+      fallbackDownloadChunks = [];
+    }
+    if (generation !== downloadGeneration) return;
+    const logicalPath = currentPath.value ? `${currentPath.value}/${entry.name}` : entry.name;
+    downloadStatus.value = "initializing";
+    downloadMessage.value = "服务器正在验证权限并计算源文件摘要";
+    send("DOWNLOAD_INIT", { path: logicalPath });
+  } catch (error) {
+    if (isAbortError(error)) {
+      downloadStatus.value = "cancelled";
+      downloadMessage.value = "用户取消了保存位置选择";
+      return;
+    }
+    await failDownload(error instanceof Error ? error.message : "无法准备下载目标");
+  }
+}
+
+async function handleDownloadBinary(data: Blob | ArrayBuffer): Promise<void> {
+  if (downloadStatus.value !== "downloading" || !downloadTransferId.value || !downloadHasher) {
+    addLog("收到不属于活动下载任务的二进制帧");
+    return;
+  }
+  const generation = downloadGeneration;
+  try {
+    const bytes = data instanceof Blob ? new Uint8Array(await data.arrayBuffer()) : new Uint8Array(data);
+    const frame = parseBinaryFrame(bytes, 1024 * 1024);
+    if (frame.header.messageType !== BINARY_MESSAGE_TYPES.downloadChunk
+      || frame.header.transferId !== downloadTransferId.value
+      || frame.header.errorCode !== 0
+      || frame.header.metadataLength !== 0
+      || (frame.header.flags & BINARY_FLAGS.ackRequired) === 0
+      || frame.header.fileSize !== BigInt(downloadFileSize)
+      || frame.header.offset !== BigInt(downloadExpectedOffset)
+      || frame.payload.byteLength === 0
+      || downloadExpectedOffset + frame.payload.byteLength > downloadFileSize
+      || !equalBytes(sha256(frame.payload), frame.header.payloadSha256)) {
+      throw new Error("服务器下载分块的类型、偏移、长度或 SHA-256 无效");
+    }
+    if (downloadTemporaryWritable) {
+      await downloadTemporaryWritable.write(new Uint8Array(frame.payload).buffer as ArrayBuffer);
+    } else {
+      if (downloadExpectedOffset + frame.payload.byteLength > FALLBACK_DOWNLOAD_LIMIT) {
+        throw new Error("兼容模式下载超过 32 MiB 内存限制");
+      }
+      fallbackDownloadChunks.push(new Uint8Array(frame.payload).buffer as ArrayBuffer);
+    }
+    if (generation !== downloadGeneration) return;
+    downloadHasher.update(frame.payload);
+    downloadExpectedOffset += frame.payload.byteLength;
+    updateDownloadMetrics();
+    send("DOWNLOAD_ACK", { transferId: downloadTransferId.value, nextOffset: downloadExpectedOffset });
+  } catch (error) {
+    const transferId = downloadTransferId.value;
+    if (transferId && socket?.readyState === WebSocket.OPEN) send("DOWNLOAD_ABORT", { transferId });
+    await failDownload(error instanceof Error ? error.message : "接收下载分块失败");
+  }
+}
+
+async function handleDownloadFinish(value: unknown): Promise<void> {
+  if (!downloadTransferId.value || !downloadHasher || downloadStatus.value !== "downloading") return;
+  const payload = asRecord(value);
+  const transferId = readString(payload, "transferId");
+  const fileSize = readNumber(payload, "fileSize");
+  const fileSha256 = readString(payload, "fileSha256");
+  if (transferId !== downloadTransferId.value) return;
+  downloadStatus.value = "verifying";
+  downloadMessage.value = "正在验证整文件 SHA-256";
+  const actualSha256 = nobleBytesToHex(downloadHasher.digest());
+  downloadHasher = undefined;
+  const success = downloadExpectedOffset === downloadFileSize
+    && fileSize === downloadFileSize
+    && fileSha256 === downloadExpectedSha256
+    && actualSha256 === downloadExpectedSha256;
+  if (downloadTemporaryWritable) {
+    await downloadTemporaryWritable.close();
+    downloadTemporaryWritable = undefined;
+  }
+  if (!success) {
+    send("DOWNLOAD_COMPLETE", {
+      transferId, success: false, receivedSize: downloadExpectedOffset, fileSha256: actualSha256,
+    });
+    await failDownload("整文件大小或 SHA-256 校验失败，文件不会交付");
+    return;
+  }
+  downloadStatus.value = "confirming";
+  downloadMessage.value = "完整性验证通过，等待服务器确认任务完成";
+  send("DOWNLOAD_COMPLETE", {
+    transferId, success: true, receivedSize: downloadExpectedOffset, fileSha256: actualSha256,
+  });
+}
+
+async function deliverVerifiedDownload(): Promise<void> {
+  downloadStatus.value = "saving";
+  downloadMessage.value = "校验通过，正在交付文件";
+  try {
+    if (downloadFinalHandle && downloadTemporaryHandle) {
+      const source = await downloadTemporaryHandle.getFile();
+      const reader = source.stream().getReader();
+      const destination = await downloadFinalHandle.createWritable();
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          await destination.write(value);
+        }
+        await destination.close();
+      } catch (error) {
+        await destination.abort().catch(() => undefined);
+        throw error;
+      } finally {
+        reader.releaseLock();
+      }
+    } else {
+      const blob = new Blob(fallbackDownloadChunks, { type: "application/octet-stream" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = downloadFileName.value;
+      anchor.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+    }
+    downloadProgress.value = 100;
+    downloadStatus.value = "completed";
+    downloadMessage.value = "下载完成，文件已通过 SHA-256 校验";
+    downloadTransferId.value = undefined;
+    addLog("文件下载完成，WebSocket 连接保持正常");
+    await cleanupDownloadTarget();
+  } catch (error) {
+    await failDownload(error instanceof Error ? error.message : "保存已验证文件失败");
+  }
+}
+
+function cancelDownload(): void {
+  downloadGeneration += 1;
+  const transferId = downloadTransferId.value;
+  if (transferId && socket?.readyState === WebSocket.OPEN) {
+    downloadStatus.value = "cancelling";
+    downloadMessage.value = "正在取消下载并清理临时内容";
+    send("DOWNLOAD_ABORT", { transferId });
+  } else {
+    downloadStatus.value = "cancelled";
+    downloadMessage.value = "下载已取消";
+    void cleanupDownloadTarget();
+  }
+}
+
+function updateDownloadMetrics(): void {
+  downloadProgress.value = downloadFileSize === 0 ? 100 : Math.round(downloadExpectedOffset / downloadFileSize * 100);
+  const elapsedSeconds = Math.max((performance.now() - downloadStartedAt) / 1000, 0.001);
+  downloadSpeed.value = downloadExpectedOffset / elapsedSeconds;
+  downloadMessage.value = `${formatBytes(downloadExpectedOffset)} / ${formatBytes(downloadFileSize)}`;
+}
+
+function isDownloadActive(): boolean {
+  return ["selecting", "initializing", "downloading", "verifying", "confirming", "saving", "cancelling"].includes(downloadStatus.value);
+}
+
+function isDownloadCancelable(): boolean {
+  return ["selecting", "initializing", "downloading", "verifying", "confirming"].includes(downloadStatus.value);
+}
+
+function resetDownloadState(): void {
+  downloadGeneration += 1;
+  downloadStatus.value = "idle";
+  downloadProgress.value = 0;
+  downloadSpeed.value = 0;
+  downloadFileSize = 0;
+  downloadExpectedOffset = 0;
+  downloadExpectedSha256 = "";
+  downloadHasher = undefined;
+  downloadTransferId.value = undefined;
+  fallbackDownloadChunks = [];
+}
+
+async function failDownload(message: string): Promise<void> {
+  downloadGeneration += 1;
+  downloadStatus.value = "error";
+  downloadMessage.value = message;
+  downloadTransferId.value = undefined;
+  downloadHasher = undefined;
+  addLog(`下载失败：${message}`);
+  await cleanupDownloadTarget();
+}
+
+async function cleanupDownloadTarget(): Promise<void> {
+  if (downloadTemporaryWritable) {
+    await downloadTemporaryWritable.abort().catch(() => undefined);
+    downloadTemporaryWritable = undefined;
+  }
+  if (downloadTemporaryRoot && downloadTemporaryName) {
+    await downloadTemporaryRoot.removeEntry(downloadTemporaryName).catch(() => undefined);
+  }
+  downloadTemporaryRoot = undefined;
+  downloadTemporaryHandle = undefined;
+  downloadTemporaryName = "";
+  downloadFinalHandle = undefined;
+  fallbackDownloadChunks = [];
+}
+
+function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.byteLength !== right.byteLength) return false;
+  let difference = 0;
+  for (let index = 0; index < left.byteLength; index += 1) difference |= (left[index] ?? 0) ^ (right[index] ?? 0);
+  return difference === 0;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
 }
 
 function selectFile(event: Event): void {
@@ -349,6 +647,7 @@ function login(): void {
 function logout(): void {
   if (authStatus.value === "authenticated") {
     if (["hashing", "initializing", "uploading", "verifying"].includes(uploadStatus.value)) cancelUpload();
+    if (isDownloadActive()) cancelDownload();
     send("AUTH_LOGOUT", {});
   }
 }
@@ -411,6 +710,8 @@ function handleServerError(value: unknown): void {
 
 function clearAuthentication(): void {
   resetUploadState();
+  resetDownloadState();
+  void cleanupDownloadTarget();
   sessionToken = undefined;
   currentUser.value = undefined;
   sessionExpiresAt.value = undefined;
@@ -507,7 +808,7 @@ onBeforeUnmount(disconnect);
 
     <section v-if="authStatus !== 'authenticated'" class="login-layout">
       <div class="login-copy">
-        <span class="phase-pill">Phase 2.2</span>
+        <span class="phase-pill">Phase 2.3</span>
         <h2>先验证身份，再访问私人空间</h2>
         <p>密码通过 WebSocket 自定义协议提交，服务端使用 Argon2id 验证；重连时必须重新验证短期会话令牌。</p>
       </div>
@@ -568,7 +869,7 @@ onBeforeUnmount(disconnect);
             </div>
             <el-button
               type="primary"
-              :disabled="!selectedFile || connectionStatus !== 'connected' || authStatus !== 'authenticated' || ['hashing', 'initializing', 'uploading', 'verifying', 'cancelling'].includes(uploadStatus)"
+              :disabled="!selectedFile || connectionStatus !== 'connected' || authStatus !== 'authenticated' || isDownloadActive() || ['hashing', 'initializing', 'uploading', 'verifying', 'cancelling'].includes(uploadStatus)"
               @click="startUpload"
             >上传</el-button>
             <el-button
@@ -587,6 +888,23 @@ onBeforeUnmount(disconnect);
             </div>
           </div>
         </section>
+        <section v-if="downloadStatus !== 'idle'" class="download-panel">
+          <div class="card-header">
+            <div class="selected-file-copy">
+              <strong>{{ downloadFileName || '下载任务' }}</strong>
+              <span>{{ downloadMessage }}</span>
+            </div>
+            <el-button v-if="isDownloadCancelable()" type="danger" plain @click="cancelDownload">取消下载</el-button>
+          </div>
+          <el-progress
+            :percentage="downloadProgress"
+            :status="downloadStatus === 'error' ? 'exception' : downloadStatus === 'completed' ? 'success' : undefined"
+          />
+          <div class="download-meta">
+            <span v-if="downloadSpeed > 0">{{ formatBytes(downloadSpeed) }}/s</span>
+            <el-tag size="small">{{ downloadStatus }}</el-tag>
+          </div>
+        </section>
         <el-table :data="fileEntries" empty-text="私人目录为空；可在上方选择文件上传" @row-dblclick="openDirectory">
           <el-table-column label="名称" min-width="240">
             <template #default="scope"><span :class="{ 'directory-link': scope.row.type === 'directory' }">{{ scope.row.type === 'directory' ? '📁' : '📄' }} {{ scope.row.name }}</span></template>
@@ -594,6 +912,17 @@ onBeforeUnmount(disconnect);
           <el-table-column prop="type" label="类型" width="110" />
           <el-table-column label="大小" width="140"><template #default="scope">{{ scope.row.type === 'file' ? formatBytes(scope.row.size) : '—' }}</template></el-table-column>
           <el-table-column label="修改时间" width="200"><template #default="scope">{{ new Date(scope.row.modifiedAt).toLocaleString() }}</template></el-table-column>
+          <el-table-column label="操作" width="120" fixed="right">
+            <template #default="scope">
+              <el-button
+                v-if="scope.row.type === 'file'"
+                type="primary"
+                text
+                :disabled="isDownloadActive() || ['hashing', 'initializing', 'uploading', 'verifying', 'cancelling'].includes(uploadStatus)"
+                @click="startDownload(scope.row)"
+              >下载</el-button>
+            </template>
+          </el-table-column>
         </el-table>
       </el-card>
     </template>
@@ -606,6 +935,6 @@ onBeforeUnmount(disconnect);
       <details><summary>最近协议事件</summary><ul class="event-list"><li v-for="entry in eventLog" :key="entry">{{ entry }}</li></ul></details>
     </el-card>
 
-    <el-alert title="当前仍是本机 ws:// 开发链路；正式 TLS/WSS 将在 Phase 3 完成。" type="warning" :closable="false" show-icon />
+    <el-alert title="当前仍是本机 ws:// 开发链路；正式 TLS/WSS 将在 Phase 3 完成。Edge/Chrome 使用流式落盘，其他浏览器兼容模式限制为 32 MiB。" type="warning" :closable="false" show-icon />
   </main>
 </template>

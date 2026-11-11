@@ -17,6 +17,10 @@ export interface RuntimeConfig {
   uploadChunkSize: number;
   maxActiveUploadsGlobal: number;
   maxActiveUploadsPerUser: number;
+  downloadChunkSize: number;
+  downloadAckTimeoutMs: number;
+  maxActiveDownloadsGlobal: number;
+  maxActiveDownloadsPerUser: number;
 }
 
 export function loadRuntimeConfig(environment: NodeJS.ProcessEnv = process.env): RuntimeConfig {
@@ -34,6 +38,10 @@ export function loadRuntimeConfig(environment: NodeJS.ProcessEnv = process.env):
     uploadChunkSize: positiveInteger(environment.SFT_UPLOAD_CHUNK_SIZE, 256 * 1024),
     maxActiveUploadsGlobal: positiveInteger(environment.SFT_MAX_ACTIVE_UPLOADS_GLOBAL, 32),
     maxActiveUploadsPerUser: positiveInteger(environment.SFT_MAX_ACTIVE_UPLOADS_PER_USER, 1),
+    downloadChunkSize: positiveInteger(environment.SFT_DOWNLOAD_CHUNK_SIZE, 256 * 1024),
+    downloadAckTimeoutMs: positiveInteger(environment.SFT_DOWNLOAD_ACK_TIMEOUT_MS, 15_000),
+    maxActiveDownloadsGlobal: positiveInteger(environment.SFT_MAX_ACTIVE_DOWNLOADS_GLOBAL, 32),
+    maxActiveDownloadsPerUser: positiveInteger(environment.SFT_MAX_ACTIVE_DOWNLOADS_PER_USER, 1),
   };
 }
 

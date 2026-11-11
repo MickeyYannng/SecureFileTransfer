@@ -1,6 +1,6 @@
 # SFTP-WS v1 应用层协议草案
 
-状态：**Draft / Phase 2.2 authentication and single-file upload subsets implemented**。名称 `SFTP-WS` 仅为本实验协议名，不应与 SSH File Transfer Protocol（通常也缩写 SFTP）混淆；最终报告可改用更不易混淆的 `UCAS-SFT/1`。
+状态：**Draft / Phase 2.3 authentication, single-file upload and download subsets implemented**。名称 `SFTP-WS` 仅为本实验协议名，不应与 SSH File Transfer Protocol（通常也缩写 SFTP）混淆；最终报告可改用更不易混淆的 `UCAS-SFT/1`。
 
 ## 1. 设计目标
 
@@ -42,7 +42,9 @@ Phase 1 已实现：`HELLO`、`HELLO_ACK`、`HEARTBEAT_PING`、`HEARTBEAT_PONG`�
 
 Phase 2.1 已增加：`AUTH_LOGIN`、`AUTH_TOKEN`、`AUTH_SUCCESS`、`AUTH_LOGOUT/ACK`、`AUTH_ME/RESULT`、`FILE_LIST_REQUEST/RESULT`。文件列表是受保护的控制请求，不是文件内容传输。
 
-Phase 2.2 已增加：`UPLOAD_INIT`、`UPLOAD_READY`、`UPLOAD_ACK`、`UPLOAD_FINISH`、`UPLOAD_COMPLETE`、`UPLOAD_ABORT/ABORTED`、`UPLOAD_ERROR`，以及二进制 `UPLOAD_CHUNK`。下载消息留到 Phase 2.3。
+Phase 2.2 已增加：`UPLOAD_INIT`、`UPLOAD_READY`、`UPLOAD_ACK`、`UPLOAD_FINISH`、`UPLOAD_COMPLETE`、`UPLOAD_ABORT/ABORTED`、`UPLOAD_ERROR`，以及二进制 `UPLOAD_CHUNK`。
+
+Phase 2.3 已增加：`DOWNLOAD_INIT`、`DOWNLOAD_READY`、`DOWNLOAD_ACK`、`DOWNLOAD_FINISH`、`DOWNLOAD_COMPLETE`、`DOWNLOAD_ABORT`、`DOWNLOAD_ERROR`，以及二进制 `DOWNLOAD_CHUNK`。
 
 ### 3.3 单文件上传控制消息
 
@@ -58,6 +60,21 @@ Phase 2.2 已增加：`UPLOAD_INIT`、`UPLOAD_READY`、`UPLOAD_ACK`、`UPLOAD_FI
 | `UPLOAD_ERROR` | S→C | `{ code, message, retryable, transferId? }` | 上传专用规范错误；不泄露宿主路径或堆栈 |
 
 所有上传控制请求仍使用逻辑头中的 `requestId` 做请求/响应关联。服务端不接受客户端提供 `userId`；任务所有者来自当前有效会话。
+
+### 3.4 单文件下载控制消息
+
+| 消息 | 方向 | payload | 语义 |
+| --- | --- | --- | --- |
+| `DOWNLOAD_INIT` | C→S | `{ path }` | 请求当前用户私人目录中的逻辑相对路径 |
+| `DOWNLOAD_READY` | S→C | `{ transferId, path, fileName, fileSize, fileSha256, chunkSize, nextOffset }` | 服务端打开文件、流式计算稳定摘要并建立任务；Phase 2.3 偏移恒为 0 |
+| `DOWNLOAD_ACK` | C→S | `{ transferId, nextOffset }` | 客户端已校验并持久/缓存当前块，允许服务端发送下一块 |
+| `DOWNLOAD_FINISH` | S→C | `{ transferId, fileSize, fileSha256 }` | 服务端已收到最后一块 ACK，并复核发送摘要和源文件身份；这还不是最终成功 |
+| `DOWNLOAD_COMPLETE` | C→S | `{ transferId, success, receivedSize, fileSha256 }` | 客户端整文件校验结果；只有精确匹配才成功 |
+| `DOWNLOAD_COMPLETE` | S→C | 上述字段加 `{ accepted: true }` | 服务端接受客户端完整性结果并释放任务；客户端此后交付文件 |
+| `DOWNLOAD_ABORT` | C→S / S→C | `{ transferId, acknowledged? }` | 取消请求及确认，关闭文件句柄并释放任务 |
+| `DOWNLOAD_ERROR` | S→C | `{ code, message, retryable, transferId? }` | 下载错误；源变化、ACK 超时和非法偏移均不会返回成功 |
+
+`DOWNLOAD_FINISH` 只把状态从“发送中”推进到“等待客户端整文件确认”。服务端必须等到有效的 `DOWNLOAD_COMPLETE(success=true)` 才标记完成；失败结果、超时或断线均清理为失败/取消。
 
 ### 3.1 认证状态机
 
@@ -138,7 +155,7 @@ sequenceDiagram
 | 0 | 4 | magic | ASCII `SFT1`，快速拒绝错协议 |
 | 4 | 1 | version | `1` |
 | 5 | 1 | headerLength | 固定 `100`；为后续扩展保留 |
-| 6 | 2 | messageType | Phase 2.2 的 `0x0201` 表示 `UPLOAD_CHUNK` |
+| 6 | 2 | messageType | `0x0201` 表示 `UPLOAD_CHUNK`；`0x0202` 表示 `DOWNLOAD_CHUNK` |
 | 8 | 2 | flags | Phase 2.2 要求 `ACK_REQUIRED=0x0001`；`FINAL=0x0002` 已保留但不作为完成依据 |
 | 10 | 2 | errorCode | 成功为 0；错误码命名空间，数据帧通常为 0 |
 | 12 | 16 | requestId | UUID 的 128 位二进制形式；全零表示无请求关联 |
@@ -158,6 +175,13 @@ sequenceDiagram
 - `fileSize` 必须等于初始化声明值；`offset` 必须等于上一次 ACK 的 `persistedOffset`。
 - `payloadSha256` 必须等于当前 payload 的 SHA-256；服务端使用常量时间比较。
 - 服务端严格检查 WebSocket message 总长度等于 `100 + metadataLength + payloadLength`，最大 metadata 为 8 KiB，默认 payload 为 256 KiB，配置范围 16 KiB–1 MiB。
+
+### 4.2 Phase 2.3 `DOWNLOAD_CHUNK` 约束
+
+- 服务端签发 `requestId`/`transferId`，使用 `messageType=0x0202`、`ACK_REQUIRED=0x0001`；最后一块可附带 `FINAL=0x0002`，但 `FINAL` 不能替代 `DOWNLOAD_FINISH/COMPLETE`。
+- `metadataLength=0`、`errorCode=0`，`fileSize` 必须与 `DOWNLOAD_READY` 相同，`offset` 必须等于客户端累计确认偏移。
+- 客户端先验证帧总长度、任务、大小、严格顺序偏移和分块 SHA-256，安全写入后才发送 `DOWNLOAD_ACK(nextOffset)`。
+- 同一任务只允许一个未确认分块；ACK 偏移错误、重复 ACK、ACK 超时、取消或断线立即关闭句柄并释放任务。
 
 ## 5. 单文件上传状态机与不变量
 
@@ -220,6 +244,55 @@ sequenceDiagram
 
 客户端先用 1 MiB `File.slice()` 窗口增量计算整文件 SHA-256，再按服务端协商大小逐块读取。每个块只在收到 `UPLOAD_ACK` 后发送下一个块，形成简单背压；任一时刻不会把整个文件载入内存。
 
+## 5.2 单文件下载状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> Initializing: DOWNLOAD_INIT
+    Initializing --> Sending: DOWNLOAD_READY + first DOWNLOAD_CHUNK
+    Initializing --> Failed: authorization/path/hash error
+    Sending --> AwaitingAck: DOWNLOAD_CHUNK
+    AwaitingAck --> Sending: valid DOWNLOAD_ACK
+    AwaitingAck --> Failed: bad/duplicate ACK or timeout
+    Sending --> AwaitingComplete: all bytes ACKed + source/hash stable + DOWNLOAD_FINISH
+    AwaitingComplete --> Complete: valid DOWNLOAD_COMPLETE(success=true)
+    AwaitingComplete --> Failed: client mismatch / timeout
+    Sending --> Cancelled: DOWNLOAD_ABORT / disconnect
+    AwaitingAck --> Cancelled: DOWNLOAD_ABORT / disconnect
+    Complete --> [*]
+    Failed --> [*]
+    Cancelled --> [*]
+```
+
+### 5.3 下载时序
+
+```mermaid
+sequenceDiagram
+    participant C as Vue Client
+    participant S as WebSocket Server
+    participant DB as SQLite Session
+    participant D as Download Manager
+    participant FS as Private Storage
+    C->>S: DOWNLOAD_INIT(logical path)
+    S->>DB: revalidate bound session
+    D->>FS: safe open + stat + streaming SHA-256 + stat again
+    S-->>C: DOWNLOAD_READY(id, size, hash, chunkSize)
+    loop one chunk in flight
+        D->>FS: positional bounded read
+        S-->>C: binary DOWNLOAD_CHUNK(offset, length, chunkHash, payload)
+        C->>C: verify chunk hash + write OPFS/fallback buffer
+        C->>S: DOWNLOAD_ACK(nextOffset)
+        S->>DB: revalidate session
+    end
+    D->>D: verify sent hash + open-handle/path identity
+    S-->>C: DOWNLOAD_FINISH(size, hash)
+    C->>C: verify received size + whole-file SHA-256
+    C->>S: DOWNLOAD_COMPLETE(success, receivedSize, hash)
+    S-->>C: DOWNLOAD_COMPLETE(accepted=true)
+    C->>C: stream verified OPFS temp to selected file
+    Note over C,S: WebSocket remains open; heartbeat continues
+```
+
 ## 6. 连接协商与心跳
 
 - WebSocket 建立后，客户端第一条消息必须是 `HELLO`；服务端用 `HELLO_ACK` 返回连接 ID、心跳周期和超时。
@@ -233,7 +306,7 @@ sequenceDiagram
 | --- | --- | --- |
 | `1xxx` 协议 | `1001 INVALID_MESSAGE`, `1002 VERSION_UNSUPPORTED` | 通常否 |
 | `2xxx` 认证授权 | `2001 AUTH_REQUIRED`, `2003 FORBIDDEN` | 重新认证后可能 |
-| `3xxx` 路径/文件 | `3001 INVALID_PATH`, `3005 FILE_EXISTS`, `3007 HASH_MISMATCH`, `3008 SIZE_MISMATCH`, `3009 INVALID_OFFSET`, `3010 INVALID_CHUNK`, `3011 UPLOAD_CANCELLED` | 通常需重新发起任务 |
+| `3xxx` 路径/文件 | `3001 INVALID_PATH`, `3005 FILE_EXISTS`, `3007 HASH_MISMATCH`, `3008 SIZE_MISMATCH`, `3009 INVALID_OFFSET`, `3010 INVALID_CHUNK`, `3011 UPLOAD_CANCELLED`, `3012 DOWNLOAD_CANCELLED`, `3013 SOURCE_CHANGED`, `3014 ACK_TIMEOUT` | 通常需重新发起任务 |
 | `4xxx` 资源 | `4001 RATE_LIMITED`, `4002 QUOTA_EXCEEDED`, `4003 TOO_MANY_TASKS`, `4004 INSUFFICIENT_STORAGE` | 有退避时可能 |
 | `5xxx` 服务端 | `5001 IO_ERROR`, `5002 TEMPORARY_UNAVAILABLE` | 由 `retryable` 指示 |
 

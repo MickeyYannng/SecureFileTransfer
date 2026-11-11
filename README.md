@@ -1,6 +1,6 @@
 # Secure File Transfer (Experiment 1B)
 
-This repository is being developed incrementally for UCAS *Software and System Security* Experiment 1B. Phase 2.2 adds custom WebSocket single-file chunked upload, streaming SHA-256 verification, quota reservation, atomic no-overwrite commit, and upload progress/cancellation in the Vue GUI. Download and TLS are intentionally deferred.
+This repository is being developed incrementally for UCAS *Software and System Security* Experiment 1B. Phase 2.3 provides authenticated custom-WebSocket single-file upload and download with bounded chunks, SHA-256 verification, explicit ACK/completion states, user isolation, and GUI progress/cancellation. TLS is intentionally deferred to Phase 3.
 
 ## Quick start on Windows 11
 
@@ -34,9 +34,10 @@ npm run build
 npm test
 # Optional separate 100 MiB real upload test:
 npm run test:slow-upload --workspace @sft/server
+npm run test:slow-download --workspace @sft/server
 ```
 
-After login, choose one local file in the file-management page and click **上传文件**. The client hashes and reads it in slices; successful uploads appear in the private file list without closing the WebSocket.
+After login, upload from the panel or click **下载** beside a private file. Current Edge/Chrome use File System Access API plus an OPFS verified temporary file for bounded-memory downloads. Other browsers use a memory fallback limited to 32 MiB.
 
-See [`docs/requirements.md`](docs/requirements.md), [`docs/architecture.md`](docs/architecture.md), [`docs/protocol-draft.md`](docs/protocol-draft.md), [`docs/phase-plan.md`](docs/phase-plan.md), [`docs/phase-2.1.md`](docs/phase-2.1.md), and [`docs/phase-2.2.md`](docs/phase-2.2.md).
+See [`docs/requirements.md`](docs/requirements.md), [`docs/architecture.md`](docs/architecture.md), [`docs/protocol-draft.md`](docs/protocol-draft.md), [`docs/phase-plan.md`](docs/phase-plan.md), [`docs/phase-2.1.md`](docs/phase-2.1.md), [`docs/phase-2.2.md`](docs/phase-2.2.md), and [`docs/phase-2.3.md`](docs/phase-2.3.md).
 
