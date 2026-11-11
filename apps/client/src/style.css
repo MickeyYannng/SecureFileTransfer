@@ -1,0 +1,35 @@
+:root {
+  font-family: Inter, "Microsoft YaHei", system-ui, sans-serif;
+  color: #172033;
+  background: #eef3f8;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; }
+button, input { font: inherit; }
+
+.page-shell {
+  width: min(880px, calc(100% - 32px));
+  margin: 0 auto;
+  padding: 52px 0;
+  display: grid;
+  gap: 20px;
+}
+
+.hero { padding: 20px 0 8px; }
+.eyebrow { margin: 0 0 10px; color: #2362aa; font-weight: 700; letter-spacing: .06em; }
+h1 { margin: 0; font-size: clamp(34px, 6vw, 56px); letter-spacing: -.04em; }
+.subtitle { margin: 14px 0 0; color: #5d6b82; font-size: 18px; }
+.status-card, .log-card { border: 1px solid #dce5ef; border-radius: 14px; }
+.card-header { display: flex; align-items: center; justify-content: space-between; font-weight: 700; }
+.actions { display: flex; gap: 8px; margin-top: 20px; }
+.event-list { list-style: none; padding: 0; margin: 0; display: grid; gap: 10px; }
+.event-list li { padding: 10px 12px; border-radius: 8px; background: #f5f8fc; color: #3d4b61; font-family: Consolas, monospace; font-size: 13px; }
+
+@media (max-width: 560px) {
+  .page-shell { padding: 24px 0; }
+  .subtitle { font-size: 16px; }
+}
+

@@ -1,0 +1,28 @@
+{
+  "name": "secure-file-transfer",
+  "version": "0.1.0",
+  "private": true,
+  "description": "UCAS Software and System Security Experiment 1B",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build:protocol": "npm run build --workspace @sft/protocol",
+    "predev": "npm run build:protocol",
+    "dev": "concurrently -n server,client -c blue,green \"npm run dev --workspace @sft/server\" \"npm run dev --workspace @sft/client\"",
+    "dev:server": "npm run build:protocol && npm run dev --workspace @sft/server",
+    "dev:client": "npm run build:protocol && npm run dev --workspace @sft/client",
+    "build": "npm run build:protocol && npm run build --workspace @sft/server && npm run build --workspace @sft/client",
+    "test": "npm run build:protocol && npm run test --workspace @sft/protocol && npm run test --workspace @sft/server && npm run test --workspace @sft/client"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=22.0.0",
+    "npm": ">=10.0.0"
+  }
+}
+
