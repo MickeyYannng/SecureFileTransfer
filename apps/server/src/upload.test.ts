@@ -86,6 +86,33 @@ test("Phase 2.2 single-file upload integration", async (t) => {
     assert.equal(sha256Hex(await readFile(join(storageRoot, "users", aliceId, "one-megabyte.bin"))), sha256Hex(content));
   });
 
+  await t.test("pauses, reconnects and resumes an upload from the persisted offset", async () => {
+    const content = deterministicBytes(chunkSize * 3 + 123);
+    const first = await makeClient("Alice");
+    const ready = await first.init("resumed-upload.bin", content.length, sha256Hex(content));
+    await first.sendChunk(ready, content.subarray(0, chunkSize), 0);
+    const id = transferId(ready);
+    const paused = await first.request("UPLOAD_PAUSE", { transferId: id });
+    assert.equal(paused.type, "UPLOAD_PAUSED");
+    assert.equal(record(paused.payload).persistedOffset, chunkSize);
+    first.close();
+
+    const resumed = await makeClient("Alice");
+    const resumedReady = await resumed.request("UPLOAD_INIT", {
+      path: "resumed-upload.bin", fileSize: content.length, fileSha256: sha256Hex(content), resumeTransferId: id,
+    });
+    assert.equal(resumedReady.type, "UPLOAD_READY");
+    assert.equal(record(resumedReady.payload).nextOffset, chunkSize);
+    Object.assign(record(resumedReady.payload), { __fileSize: content.length });
+    const negotiated = record(resumedReady.payload).chunkSize as number;
+    for (let offset = chunkSize; offset < content.length; offset += negotiated) {
+      const ack = await resumed.sendChunk(resumedReady, content.subarray(offset, Math.min(content.length, offset + negotiated)), offset);
+      assert.equal(ack.type, "UPLOAD_ACK");
+    }
+    assert.equal((await resumed.request("UPLOAD_FINISH", { transferId: id })).type, "UPLOAD_COMPLETE");
+    assert.equal(sha256Hex(await readFile(join(storageRoot, "users", aliceId, "resumed-upload.bin"))), sha256Hex(content));
+  });
+
   await t.test("rejects an incorrect whole-file SHA-256 and removes temporary data", async () => {
     const content = Buffer.from("hash mismatch");
     const ready = await alice.init("bad-whole-hash.bin", content.length, "00".repeat(32));

@@ -1,6 +1,6 @@
 # SFTP-WS v1 应用层协议草案
 
-状态：**Draft / Phase 2.3 authentication, single-file upload and download subsets implemented**。名称 `SFTP-WS` 仅为本实验协议名，不应与 SSH File Transfer Protocol（通常也缩写 SFTP）混淆；最终报告可改用更不易混淆的 `UCAS-SFT/1`。
+状态：**Implemented / Experiment 1B complete**。名称 `SFTP-WS` 仅为本实验协议名，不应与 SSH File Transfer Protocol（通常也缩写 SFTP）混淆。
 
 ## 1. 设计目标
 
@@ -66,7 +66,7 @@ Phase 2.3 已增加：`DOWNLOAD_INIT`、`DOWNLOAD_READY`、`DOWNLOAD_ACK`、`DOW
 | 消息 | 方向 | payload | 语义 |
 | --- | --- | --- | --- |
 | `DOWNLOAD_INIT` | C→S | `{ path }` | 请求当前用户私人目录中的逻辑相对路径 |
-| `DOWNLOAD_READY` | S→C | `{ transferId, path, fileName, fileSize, fileSha256, chunkSize, nextOffset }` | 服务端打开文件、流式计算稳定摘要并建立任务；Phase 2.3 偏移恒为 0 |
+| `DOWNLOAD_READY` | S→C | `{ transferId, path, fileName, fileSize, fileSha256, chunkSize, nextOffset }` | 服务端打开文件、流式计算稳定摘要并建立任务；恢复时返回客户端请求的合法偏移 |
 | `DOWNLOAD_ACK` | C→S | `{ transferId, nextOffset }` | 客户端已校验并持久/缓存当前块，允许服务端发送下一块 |
 | `DOWNLOAD_FINISH` | S→C | `{ transferId, fileSize, fileSha256 }` | 服务端已收到最后一块 ACK，并复核发送摘要和源文件身份；这还不是最终成功 |
 | `DOWNLOAD_COMPLETE` | C→S | `{ transferId, success, receivedSize, fileSha256 }` | 客户端整文件校验结果；只有精确匹配才成功 |
@@ -191,8 +191,10 @@ stateDiagram-v2
     Initializing --> Receiving: UPLOAD_READY
     Initializing --> Failed: UPLOAD_ERROR
     Receiving --> Receiving: UPLOAD_CHUNK / UPLOAD_ACK
+    Receiving --> Paused: UPLOAD_PAUSE / UPLOAD_PAUSED
+    Paused --> Receiving: UPLOAD_INIT(resumeTransferId) / UPLOAD_READY(nextOffset)
     Receiving --> Verifying: UPLOAD_FINISH and received == fileSize
-    Receiving --> Cancelled: UPLOAD_ABORT or disconnect
+    Receiving --> Cancelled: UPLOAD_ABORT or unexpected disconnect
     Receiving --> Failed: invalid frame / I-O failure / expired session
     Verifying --> Complete: size + SHA-256 match + atomic commit
     Verifying --> Failed: mismatch / I-O / name conflict
@@ -205,7 +207,7 @@ stateDiagram-v2
 关键不变量：
 
 1. 未成功认证的连接不能创建文件任务。
-2. `transferId` 只属于一个已认证用户和创建它的连接；Phase 2.2 不支持跨连接恢复或冒用。
+2. `transferId` 只属于一个已认证用户；跨连接恢复还必须匹配原路径、大小和 SHA-256，不能跨用户冒用。
 3. 顺序模式下仅接受 `offset == acknowledgedOffset`；重复、跳跃和乱序块会使当前任务失败并清理临时文件。
 4. `offset + payloadLength <= fileSize`，所有运算先检查溢出。
 5. 只有精确收到 `fileSize` 字节且整文件 SHA-256 匹配，临时文件才以“不覆盖”方式原子提交并发送 `UPLOAD_COMPLETE`。
@@ -243,6 +245,14 @@ sequenceDiagram
 ```
 
 客户端先用 1 MiB `File.slice()` 窗口增量计算整文件 SHA-256，再按服务端协商大小逐块读取。每个块只在收到 `UPLOAD_ACK` 后发送下一个块，形成简单背压；任一时刻不会把整个文件载入内存。
+
+暂停时客户端发送 `UPLOAD_PAUSE(transferId)`，服务端返回 `UPLOAD_PAUSED(persistedOffset)`。继续时重新建立 WSS 并认证，发送带 `resumeTransferId` 的 `UPLOAD_INIT`；服务端以 `UPLOAD_READY(nextOffset)` 确认继续位置。下载继续使用 `DOWNLOAD_INIT(path, offset)`，服务端重新校验源文件后从该偏移发送，并为最终整文件摘要补算前缀状态。
+
+## 5.3 Ed25519 认证与身份限速
+
+密码登录后可用 `AUTH_PUBLIC_KEY_REGISTER(publicKeySpki)` 注册 Ed25519 公钥。公钥登录依次使用 `AUTH_KEY_CHALLENGE(username)`、`AUTH_KEY_CHALLENGE_RESULT(challengeId, challenge)` 和 `AUTH_KEY_RESPONSE(challengeId, signature)`；成功后仍返回标准 `AUTH_SUCCESS` 会话。挑战随机、短期、一次性，私钥从不进入协议。
+
+带宽不是客户端声明字段。服务端根据认证会话中的 `role`，在处理上传 payload 和发送下载 payload 前使用按用户共享的漏桶等待；因此修改 GUI 或并发创建任务不能绕过普通/VIP 限速。
 
 ## 5.2 单文件下载状态机
 

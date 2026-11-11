@@ -19,12 +19,12 @@ try {
   } else {
     const alicePassword = requiredSecret("SFT_SEED_ALICE_PASSWORD");
     const bobPassword = requiredSecret("SFT_SEED_BOB_PASSWORD");
-    const alice = await auth.createUser({ username: "Alice", password: alicePassword, displayName: "Alice" });
-    const bob = await auth.createUser({ username: "Bob", password: bobPassword, displayName: "Bob" });
+    const alice = await auth.createUser({ username: "Alice", password: alicePassword, displayName: "Alice", role: "user", replaceExistingPassword: true });
+    const bob = await auth.createUser({ username: "Bob", password: bobPassword, displayName: "Bob", role: "vip", replaceExistingPassword: true });
     await storage.ensureUserRoot(alice.user.id);
     await storage.ensureUserRoot(bob.user.id);
-    console.info(`Alice: ${alice.created ? "created" : "already exists"}`);
-    console.info(`Bob: ${bob.created ? "created" : "already exists"}`);
+    console.info(`Alice: ${alice.created ? "created" : "password/role refreshed"}`);
+    console.info(`Bob: ${bob.created ? "created" : "password/role refreshed"}`);
   }
 } finally {
   database.close();

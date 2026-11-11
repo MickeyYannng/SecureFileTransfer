@@ -32,6 +32,8 @@ const authError = ref("");
 const currentUser = ref<PublicUser>();
 const sessionExpiresAt = ref<number>();
 const loginForm = reactive({ username: "", password: "" });
+const publicKeyFile = ref<File>();
+let pendingPublicLoginKey: CryptoKey | undefined;
 const currentPath = ref("");
 const fileEntries = ref<FileListEntry[]>([]);
 const storageUsage = ref<StorageUsage>();
@@ -78,7 +80,7 @@ interface TransferTaskView {
 }
 const batchSelectedFiles = ref<File[]>([]);
 const transferTasks = ref<TransferTaskView[]>([]);
-const taskControllers = new Map<string, { cancel(): Promise<void> }>();
+const taskControllers = new Map<string, { cancel(): Promise<void>; pause(): Promise<void>; resume(): Promise<void> }>();
 const uploadTaskViews = computed(() => transferTasks.value.filter((task) => task.direction === "upload"));
 const downloadTaskViews = computed(() => transferTasks.value.filter((task) => task.direction === "download"));
 
@@ -143,10 +145,10 @@ function connect(): void {
 
   socket.addEventListener("close", () => {
     if (["initializing", "uploading", "verifying", "cancelling"].includes(uploadStatus.value)) {
-      failUpload("连接中断；Phase 2.2 不支持断点续传，请重新上传");
+      failUpload("主连接中断；请等待自动重连");
     }
     if (["initializing", "downloading", "verifying", "confirming", "saving", "cancelling"].includes(downloadStatus.value)) {
-      void failDownload("连接中断；Phase 2.3 不支持断点续传，请重新下载");
+      void failDownload("主连接中断；请等待自动重连");
     }
     connectionStatus.value = "disconnected";
     authStatus.value = sessionToken ? "authenticating" : "unauthenticated";
@@ -194,6 +196,14 @@ function handleMessage(message: ReturnType<typeof parseControlMessage>): void {
     addLog(`用户 ${user.username} 认证成功`);
     send("AUTH_ME", {});
     refreshFiles();
+    return;
+  }
+  if (message.type === "AUTH_KEY_CHALLENGE_RESULT") {
+    void answerPublicKeyChallenge(message.payload);
+    return;
+  }
+  if (message.type === "AUTH_PUBLIC_KEY_REGISTERED") {
+    addLog("Ed25519 公钥已注册，可用于下次登录");
     return;
   }
   if (message.type === "AUTH_ME_RESULT") {
@@ -569,7 +579,7 @@ function startBatchUploads(): void {
       const worker = new BatchUploadWorker(view, file, currentPath.value, sessionToken!, wsUrl.value);
       taskControllers.set(view.id, worker);
       await worker.run().finally(() => {
-        taskControllers.delete(view.id);
+        if (["completed", "cancelled", "error"].includes(view.status)) taskControllers.delete(view.id);
         if (view.status === "completed") refreshFiles();
       });
     }
@@ -600,7 +610,7 @@ async function startBatchDownload(entry: FileListEntry): Promise<void> {
       view.message = error instanceof Error ? error.message : "下载失败";
     }
   } finally {
-    taskControllers.delete(view.id);
+    if (["completed", "cancelled", "error"].includes(view.status)) taskControllers.delete(view.id);
   }
 }
 
@@ -620,6 +630,17 @@ function cancelTransferTask(task: TransferTaskView): void {
     task.status = "cancelled";
     task.message = "已取消";
   }
+}
+
+function pauseTransferTask(task: TransferTaskView): void {
+  void taskControllers.get(task.id)?.pause();
+}
+
+function resumeTransferTask(task: TransferTaskView): void {
+  void taskControllers.get(task.id)?.resume().finally(() => {
+    if (["completed", "cancelled", "error"].includes(task.status)) taskControllers.delete(task.id);
+    if (task.status === "completed") refreshFiles();
+  });
 }
 
 function clearFinishedTasks(): void {
@@ -655,7 +676,10 @@ class TaskProtocolSocket {
   private socket?: WebSocket;
   private readonly pending = new Map<string, { resolve(value: ReturnType<typeof parseControlMessage>): void; reject(error: Error): void }>();
   private readonly events: Array<ArrayBuffer | ReturnType<typeof parseControlMessage>> = [];
-  private readonly eventWaiters: Array<(value: ArrayBuffer | ReturnType<typeof parseControlMessage>) => void> = [];
+  private readonly eventWaiters: Array<{
+    resolve(value: ArrayBuffer | ReturnType<typeof parseControlMessage>): void;
+    reject(error: Error): void;
+  }> = [];
 
   constructor(private readonly url: string, private readonly token: string) {}
 
@@ -681,6 +705,7 @@ class TaskProtocolSocket {
     socket.addEventListener("close", () => {
       for (const waiter of this.pending.values()) waiter.reject(new Error("任务连接已关闭"));
       this.pending.clear();
+      for (const waiter of this.eventWaiters.splice(0)) waiter.reject(new Error("任务连接已关闭"));
     });
     const hello = await this.request("HELLO", { protocol: PROTOCOL_NAME, clientName: "sft-batch-task" });
     if (hello.type !== "HELLO_ACK") throw new Error("任务协议协商失败");
@@ -711,26 +736,28 @@ class TaskProtocolSocket {
   async nextEvent(): Promise<ArrayBuffer | ReturnType<typeof parseControlMessage>> {
     const event = this.events.shift();
     if (event) return event;
-    return new Promise((resolvePromise) => this.eventWaiters.push(resolvePromise));
+    return new Promise((resolvePromise, reject) => this.eventWaiters.push({ resolve: resolvePromise, reject }));
   }
 
   close(): void { this.socket?.close(1000, "task finished"); }
   private pushEvent(value: ArrayBuffer | ReturnType<typeof parseControlMessage>): void {
     const waiter = this.eventWaiters.shift();
-    if (waiter) waiter(value); else this.events.push(value);
+    if (waiter) waiter.resolve(value); else this.events.push(value);
   }
 }
 
 class BatchUploadWorker {
   private protocol?: TaskProtocolSocket;
   private transferId?: string;
+  private fileHash?: string;
+  private paused = false;
+  private started = performance.now();
   constructor(
     private readonly view: TransferTaskView, private readonly file: File, private readonly path: string,
     private readonly token: string, private readonly url: string,
   ) {}
 
   async run(): Promise<void> {
-    const started = performance.now();
     try {
       if (this.view.cancelled) return;
       this.view.status = "hashing";
@@ -739,19 +766,31 @@ class BatchUploadWorker {
         if (this.view.cancelled) return;
         hasher.update(new Uint8Array(await this.file.slice(offset, Math.min(this.file.size, offset + 1024 * 1024)).arrayBuffer()));
       }
+      this.fileHash = nobleBytesToHex(hasher.digest());
+      await this.transfer();
+    } catch (error) {
+      if (!this.view.cancelled && !this.paused) { this.view.status = "error"; this.view.message = error instanceof Error ? error.message : "上传失败"; }
+    } finally { this.protocol?.close(); }
+  }
+
+  private async transfer(): Promise<void> {
       this.protocol = new TaskProtocolSocket(this.url, this.token);
       await this.protocol.connect();
       const logicalPath = this.path ? `${this.path}/${this.file.name}` : this.file.name;
       const ready = await this.protocol.request("UPLOAD_INIT", {
-        path: logicalPath, fileSize: this.file.size, fileSha256: nobleBytesToHex(hasher.digest()),
+        path: logicalPath, fileSize: this.file.size, fileSha256: this.fileHash,
+        ...(this.transferId ? { resumeTransferId: this.transferId } : {}),
       });
       if (ready.type !== "UPLOAD_READY") throw protocolTaskError(ready);
       const payload = asRecord(ready.payload);
       this.transferId = readString(payload, "transferId");
       const chunkSize = readNumber(payload, "chunkSize");
+      let offset = readNumber(payload, "nextOffset");
+      this.paused = false;
       this.view.status = "uploading";
-      for (let offset = 0; offset < this.file.size; offset += chunkSize) {
+      while (offset < this.file.size) {
         if (this.view.cancelled) { await this.cancel(); return; }
+        if (this.paused) return;
         const chunk = new Uint8Array(await this.file.slice(offset, Math.min(this.file.size, offset + chunkSize)).arrayBuffer());
         const requestId = crypto.randomUUID();
         const frame = encodeBinaryFrame({
@@ -761,19 +800,45 @@ class BatchUploadWorker {
         const ack = await this.protocol.requestBinary(requestId, frame);
         if (ack.type !== "UPLOAD_ACK") throw protocolTaskError(ack);
         const persisted = readNumber(asRecord(ack.payload), "persistedOffset");
-        updateTaskView(this.view, persisted, this.file.size, started);
+        offset = persisted;
+        updateTaskView(this.view, persisted, this.file.size, this.started);
       }
       const complete = await this.protocol.request("UPLOAD_FINISH", { transferId: this.transferId });
       if (complete.type !== "UPLOAD_COMPLETE") throw protocolTaskError(complete);
       this.view.status = "completed"; this.view.progress = 100; this.view.message = "上传完成";
-    } catch (error) {
-      if (!this.view.cancelled) { this.view.status = "error"; this.view.message = error instanceof Error ? error.message : "上传失败"; }
-    } finally { this.protocol?.close(); }
+  }
+
+  async pause(): Promise<void> {
+    if (!this.transferId || this.view.status !== "uploading" || !this.protocol) return;
+    const response = await this.protocol.request("UPLOAD_PAUSE", { transferId: this.transferId });
+    if (response.type !== "UPLOAD_PAUSED") throw protocolTaskError(response);
+    this.paused = true;
+    this.view.status = "paused";
+    this.view.speed = 0;
+    this.view.message = `已暂停，可从 ${formatBytes(readNumber(asRecord(response.payload), "persistedOffset"))} 继续`;
+    this.protocol.close();
+  }
+
+  async resume(): Promise<void> {
+    if (!this.paused || !this.transferId || !this.fileHash) return;
+    this.view.status = "resuming";
+    this.view.message = "正在重新连接并确认服务器偏移";
+    try { await this.transfer(); }
+    catch (error) { this.view.status = "error"; this.view.message = error instanceof Error ? error.message : "恢复上传失败"; }
+    finally { this.protocol?.close(); }
   }
 
   async cancel(): Promise<void> {
     this.view.cancelled = true; this.view.status = "cancelled"; this.view.message = "已取消";
-    if (this.protocol && this.transferId) await this.protocol.request("UPLOAD_ABORT", { transferId: this.transferId }).catch(() => undefined);
+    if (this.transferId && this.fileHash) {
+      if (this.paused) {
+        this.protocol = new TaskProtocolSocket(this.url, this.token);
+        await this.protocol.connect().catch(() => undefined);
+        const logicalPath = this.path ? `${this.path}/${this.file.name}` : this.file.name;
+        await this.protocol.request("UPLOAD_INIT", { path: logicalPath, fileSize: this.file.size, fileSha256: this.fileHash, resumeTransferId: this.transferId }).catch(() => undefined);
+      }
+      await this.protocol?.request("UPLOAD_ABORT", { transferId: this.transferId }).catch(() => undefined);
+    }
     this.protocol?.close();
   }
 }
@@ -781,55 +846,88 @@ class BatchUploadWorker {
 class BatchDownloadWorker {
   private protocol?: TaskProtocolSocket;
   private transferId?: string;
+  private paused = false;
+  private offset = 0;
+  private readonly hasher = sha256.create();
+  private started = performance.now();
   constructor(
     private readonly view: TransferTaskView, private readonly path: string, private readonly listedSize: number,
     private readonly target: BatchDownloadTarget, private readonly token: string, private readonly url: string,
   ) {}
 
   async run(): Promise<void> {
-    const started = performance.now();
     try {
+      await this.transfer();
+    } catch (error) {
+      if (!this.view.cancelled && !this.paused) {
+        this.view.status = "error"; this.view.message = error instanceof Error ? error.message : "下载失败";
+        await cleanupBatchTarget(this.target);
+      }
+    } finally { this.protocol?.close(); }
+  }
+
+  private async transfer(): Promise<void> {
       this.protocol = new TaskProtocolSocket(this.url, this.token);
       await this.protocol.connect();
-      const ready = await this.protocol.request("DOWNLOAD_INIT", { path: this.path });
+      const ready = await this.protocol.request("DOWNLOAD_INIT", { path: this.path, offset: this.offset });
       if (ready.type !== "DOWNLOAD_READY") throw protocolTaskError(ready);
       const metadata = asRecord(ready.payload);
       this.transferId = readString(metadata, "transferId");
       const fileSize = readNumber(metadata, "fileSize");
       const expectedHash = readString(metadata, "fileSha256");
+      const nextOffset = readNumber(metadata, "nextOffset");
+      if (nextOffset !== this.offset) throw new Error("服务器恢复偏移与客户端不一致");
       if (!this.target.writable && fileSize > FALLBACK_DOWNLOAD_LIMIT) throw new Error("兼容模式下载超过 32 MiB");
+      this.paused = false;
       this.view.status = "downloading";
-      const hasher = sha256.create();
-      let offset = 0;
-      while (offset < fileSize) {
+      while (this.offset < fileSize) {
         if (this.view.cancelled) { await this.cancel(); return; }
+        if (this.paused) return;
         const event = await this.protocol.nextEvent();
         if (!(event instanceof ArrayBuffer)) throw protocolTaskError(event);
         const frame = parseBinaryFrame(event, 1024 * 1024);
         if (frame.header.messageType !== BINARY_MESSAGE_TYPES.downloadChunk
-          || frame.header.transferId !== this.transferId || frame.header.offset !== BigInt(offset)
+          || frame.header.transferId !== this.transferId || frame.header.offset !== BigInt(this.offset)
           || !equalBytes(sha256(frame.payload), frame.header.payloadSha256)) throw new Error("下载分块校验失败");
         if (this.target.writable) await this.target.writable.write(new Uint8Array(frame.payload).buffer as ArrayBuffer);
         else this.target.chunks.push(new Uint8Array(frame.payload).buffer as ArrayBuffer);
-        hasher.update(frame.payload); offset += frame.payload.byteLength;
-        updateTaskView(this.view, offset, fileSize, started);
-        this.protocol.send("DOWNLOAD_ACK", { transferId: this.transferId, nextOffset: offset });
+        this.hasher.update(frame.payload); this.offset += frame.payload.byteLength;
+        updateTaskView(this.view, this.offset, fileSize, this.started);
+        this.protocol.send("DOWNLOAD_ACK", { transferId: this.transferId, nextOffset: this.offset });
       }
       const finish = await this.protocol.nextEvent();
       if (finish instanceof ArrayBuffer || finish.type !== "DOWNLOAD_FINISH") throw new Error("缺少下载完成消息");
-      const digest = nobleBytesToHex(hasher.digest());
-      if (digest !== expectedHash || offset !== fileSize) throw new Error("整文件 SHA-256 校验失败");
+      const digest = nobleBytesToHex(this.hasher.digest());
+      if (digest !== expectedHash || this.offset !== fileSize) throw new Error("整文件 SHA-256 校验失败");
       if (this.target.writable) { await this.target.writable.close(); delete this.target.writable; }
       const complete = await this.protocol.request("DOWNLOAD_COMPLETE", {
-        transferId: this.transferId, success: true, receivedSize: offset, fileSha256: digest,
+        transferId: this.transferId, success: true, receivedSize: this.offset, fileSha256: digest,
       });
       if (complete.type !== "DOWNLOAD_COMPLETE") throw protocolTaskError(complete);
       this.view.status = "saving"; this.view.message = "校验通过，正在保存";
       await deliverBatchTarget(this.target, this.view.name);
       this.view.status = "completed"; this.view.progress = 100; this.view.message = `下载完成 · ${formatBytes(this.listedSize)}`;
-    } catch (error) {
-      if (!this.view.cancelled) { this.view.status = "error"; this.view.message = error instanceof Error ? error.message : "下载失败"; }
-    } finally { await cleanupBatchTarget(this.target); this.protocol?.close(); }
+      await cleanupBatchTarget(this.target);
+  }
+
+  async pause(): Promise<void> {
+    if (this.view.status !== "downloading") return;
+    this.paused = true;
+    this.view.status = "paused";
+    this.view.speed = 0;
+    this.view.message = `已暂停，可从 ${formatBytes(this.offset)} 继续`;
+    this.protocol?.close();
+  }
+
+  async resume(): Promise<void> {
+    if (!this.paused) return;
+    this.view.status = "resuming";
+    this.view.message = "正在重新连接并恢复下载";
+    try { await this.transfer(); }
+    catch (error) {
+      this.view.status = "error"; this.view.message = error instanceof Error ? error.message : "恢复下载失败";
+      await cleanupBatchTarget(this.target);
+    } finally { this.protocol?.close(); }
   }
 
   async cancel(): Promise<void> {
@@ -976,6 +1074,81 @@ function login(): void {
   authError.value = "";
   authStatus.value = "authenticating";
   send("AUTH_LOGIN", { username: loginForm.username, password: loginForm.password });
+}
+
+function selectPublicKeyFile(event: Event): void {
+  publicKeyFile.value = (event.target as HTMLInputElement).files?.[0];
+}
+
+async function loginWithPublicKey(): Promise<void> {
+  if (!publicKeyFile.value || !loginForm.username) {
+    authError.value = "请输入用户名并选择私钥文件";
+    return;
+  }
+  try {
+    const saved = JSON.parse(await publicKeyFile.value.text()) as { algorithm?: string; privateKeyPkcs8?: string };
+    if (saved.algorithm !== "Ed25519" || typeof saved.privateKeyPkcs8 !== "string") throw new Error("私钥文件格式错误");
+    pendingPublicLoginKey = await crypto.subtle.importKey(
+      "pkcs8", base64UrlToBytes(saved.privateKeyPkcs8).buffer as ArrayBuffer, { name: "Ed25519" }, false, ["sign"],
+    );
+    authStatus.value = "authenticating";
+    authError.value = "";
+    send("AUTH_KEY_CHALLENGE", { username: loginForm.username });
+  } catch (error) {
+    authStatus.value = "unauthenticated";
+    authError.value = error instanceof Error ? error.message : "读取私钥失败";
+  }
+}
+
+async function answerPublicKeyChallenge(value: unknown): Promise<void> {
+  try {
+    if (!pendingPublicLoginKey) throw new Error("未选择私钥");
+    const payload = asRecord(value);
+    const challengeId = readString(payload, "challengeId");
+    const challenge = base64UrlToBytes(readString(payload, "challenge"));
+    const signature = await crypto.subtle.sign({ name: "Ed25519" }, pendingPublicLoginKey, challenge.buffer as ArrayBuffer);
+    pendingPublicLoginKey = undefined;
+    send("AUTH_KEY_RESPONSE", { challengeId, signature: bytesToBase64Url(new Uint8Array(signature)) });
+  } catch (error) {
+    authStatus.value = "unauthenticated";
+    authError.value = error instanceof Error ? error.message : "公钥认证失败";
+  }
+}
+
+async function generateAndRegisterPublicKey(): Promise<void> {
+  try {
+    const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    const [spki, pkcs8] = await Promise.all([
+      crypto.subtle.exportKey("spki", pair.publicKey),
+      crypto.subtle.exportKey("pkcs8", pair.privateKey),
+    ]);
+    const privateDocument = JSON.stringify({
+      algorithm: "Ed25519",
+      username: currentUser.value?.username,
+      privateKeyPkcs8: bytesToBase64Url(new Uint8Array(pkcs8)),
+    }, null, 2);
+    const url = URL.createObjectURL(new Blob([privateDocument], { type: "application/json" }));
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `${currentUser.value?.username ?? "sft"}-ed25519-private.json`;
+    anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+    send("AUTH_PUBLIC_KEY_REGISTER", { publicKeySpki: bytesToBase64Url(new Uint8Array(spki)) });
+    addLog("已生成私钥文件；私钥只保存在你的下载目录");
+  } catch (error) {
+    addLog(`生成公钥失败：${error instanceof Error ? error.message : "未知错误"}`);
+  }
+}
+
+function bytesToBase64Url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/u, "");
+}
+
+function base64UrlToBytes(value: string): Uint8Array {
+  const base64 = value.replaceAll("-", "+").replaceAll("_", "/").padEnd(Math.ceil(value.length / 4) * 4, "=");
+  return Uint8Array.from(atob(base64), (character) => character.charCodeAt(0));
 }
 
 function logout(): void {
@@ -1145,7 +1318,7 @@ onBeforeUnmount(disconnect);
 
     <section v-if="authStatus !== 'authenticated'" class="login-layout">
       <div class="login-copy">
-        <span class="phase-pill">Phase 2.3</span>
+        <span class="phase-pill">实验 1B 完整版</span>
         <h2>先验证身份，再访问私人空间</h2>
         <p>密码通过 WebSocket 自定义协议提交，服务端使用 Argon2id 验证；重连时必须重新验证短期会话令牌。</p>
       </div>
@@ -1160,6 +1333,9 @@ onBeforeUnmount(disconnect);
           </el-form-item>
           <el-alert v-if="authError" :title="authError" type="error" :closable="false" show-icon />
           <el-button class="full-button" type="primary" :loading="authStatus === 'authenticating'" :disabled="connectionStatus !== 'connected'" @click="login">登录</el-button>
+          <el-divider>或使用 Ed25519 公钥</el-divider>
+          <label class="file-picker-label compact-picker"><span>{{ publicKeyFile?.name || '选择私钥文件' }}</span><input type="file" accept="application/json,.json" @change="selectPublicKeyFile" /></label>
+          <el-button class="full-button" plain :loading="authStatus === 'authenticating'" :disabled="connectionStatus !== 'connected' || !publicKeyFile" @click="loginWithPublicKey">公钥登录</el-button>
         </el-form>
       </el-card>
     </section>
@@ -1172,9 +1348,10 @@ onBeforeUnmount(disconnect);
           </template>
           <div class="identity-row">
             <div class="avatar">{{ currentUser?.displayName.slice(0, 1).toUpperCase() }}</div>
-            <div><strong>{{ currentUser?.displayName }}</strong><p>@{{ currentUser?.username }} · {{ currentUser?.role }}</p></div>
+            <div><strong>{{ currentUser?.displayName }}</strong><p>@{{ currentUser?.username }} · {{ currentUser?.role === 'vip' ? 'VIP（5 MiB/s）' : '普通用户（1 MiB/s）' }}</p></div>
           </div>
           <p class="session-expiry">会话有效至：{{ sessionExpiresAt ? new Date(sessionExpiresAt).toLocaleString() : '—' }}</p>
+          <el-button size="small" plain @click="generateAndRegisterPublicKey">生成并注册 Ed25519 密钥</el-button>
         </el-card>
 
         <el-card class="storage-card" shadow="never">
@@ -1218,6 +1395,8 @@ onBeforeUnmount(disconnect);
             <el-progress :percentage="task.progress" :status="task.status === 'error' ? 'exception' : task.status === 'completed' ? 'success' : undefined" />
             <div class="download-meta">
               <span>{{ task.message }}</span><span v-if="task.speed > 0">{{ formatBytes(task.speed) }}/s</span>
+              <el-button v-if="['uploading', 'downloading'].includes(task.status)" text type="warning" @click="pauseTransferTask(task)">暂停</el-button>
+              <el-button v-if="task.status === 'paused'" text type="primary" @click="resumeTransferTask(task)">继续</el-button>
               <el-button v-if="!['completed', 'cancelled', 'error'].includes(task.status)" text type="danger" @click="cancelTransferTask(task)">取消</el-button>
             </div>
           </div>
@@ -1252,6 +1431,6 @@ onBeforeUnmount(disconnect);
       <details><summary>最近协议事件</summary><ul class="event-list"><li v-for="entry in eventLog" :key="entry">{{ entry }}</li></ul></details>
     </el-card>
 
-    <el-alert title="当前仍是本机 ws:// 开发链路；正式 TLS/WSS 将在 Phase 3 完成。Edge/Chrome 使用流式落盘，其他浏览器兼容模式限制为 32 MiB。" type="warning" :closable="false" show-icon />
+    <el-alert title="当前使用 HTTPS/WSS。Edge/Chrome 支持流式落盘与断点继续；其他浏览器兼容模式限制为 32 MiB。" type="success" :closable="false" show-icon />
   </main>
 </template>

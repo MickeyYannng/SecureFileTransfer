@@ -16,6 +16,7 @@ certs/
 *.pem
 *.p12
 *.pfx
+*-ed25519-private.json
 
 *.log
 npm-debug.log*

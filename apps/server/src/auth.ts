@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, createPublicKey, randomBytes, randomUUID, verify } from "node:crypto";
 import * as argon2 from "argon2";
 import type { PublicUser } from "@sft/protocol";
 import { AppDatabase, type SessionWithUserRow, type UserRow } from "./database.js";
@@ -38,6 +38,7 @@ export class AuthFailure extends Error {
 }
 
 export class AuthService {
+  private readonly challenges = new Map<string, { userId: string; nonce: Buffer; expiresAt: number }>();
   private constructor(
     private readonly database: AppDatabase,
     private readonly options: AuthOptions,
@@ -57,11 +58,23 @@ export class AuthService {
     role?: string;
     quotaBytes?: number;
     maxFiles?: number;
+    replaceExistingPassword?: boolean;
   }): Promise<{ created: boolean; user: PublicUser }> {
     validateUsername(input.username);
     validatePassword(input.password);
     const existing = this.database.findUserByUsername(input.username);
-    if (existing) return { created: false, user: toPublicUser(existing) };
+    if (existing) {
+      if (input.replaceExistingPassword) {
+        this.database.updateSeedUser(
+          existing.id,
+          await argon2.hash(input.password, ARGON2_OPTIONS),
+          input.role ?? existing.role,
+          Date.now(),
+        );
+        return { created: false, user: toPublicUser(this.database.findUserById(existing.id) ?? existing) };
+      }
+      return { created: false, user: toPublicUser(existing) };
+    }
     const now = Date.now();
     const row = {
       id: input.id ?? randomUUID(),
@@ -94,6 +107,41 @@ export class AuthService {
     }
     if (!user || !valid) throw new AuthFailure("INVALID_CREDENTIALS", "invalid username or password");
 
+    return this.issueSession(user);
+  }
+
+  registerPublicKey(sessionId: string, publicKeySpki: string): void {
+    const session = this.validateSession(sessionId);
+    const key = parseEd25519PublicKey(publicKeySpki);
+    if (key.asymmetricKeyType !== "ed25519") throw new AuthFailure("INVALID_CREDENTIALS", "only Ed25519 public keys are accepted");
+    this.database.upsertPublicKey(session.user.id, publicKeySpki, Date.now());
+  }
+
+  createPublicKeyChallenge(username: string): { challengeId: string; challenge: string; expiresAt: number } {
+    const record = this.database.findPublicKeyByUsername(username);
+    if (!record) throw new AuthFailure("INVALID_CREDENTIALS", "public key is not registered");
+    const challengeId = randomUUID();
+    const nonce = randomBytes(32);
+    const expiresAt = Date.now() + 60_000;
+    this.challenges.set(challengeId, { userId: record.user_id, nonce, expiresAt });
+    return { challengeId, challenge: nonce.toString("base64url"), expiresAt };
+  }
+
+  authenticatePublicKey(challengeId: string, signature: string): LoginResult {
+    const challenge = this.challenges.get(challengeId);
+    this.challenges.delete(challengeId);
+    if (!challenge || challenge.expiresAt <= Date.now()) throw new AuthFailure("INVALID_CREDENTIALS", "challenge is invalid or expired");
+    const user = this.database.findUserById(challenge.userId);
+    const keyRecord = user ? this.database.findPublicKeyByUsername(user.username) : undefined;
+    let signatureBytes: Buffer;
+    try { signatureBytes = Buffer.from(signature, "base64url"); } catch { throw new AuthFailure("INVALID_CREDENTIALS", "signature is invalid"); }
+    if (!user || !keyRecord || !verify(null, challenge.nonce, parseEd25519PublicKey(keyRecord.public_key_spki), signatureBytes)) {
+      throw new AuthFailure("INVALID_CREDENTIALS", "public key signature verification failed");
+    }
+    return this.issueSession(user);
+  }
+
+  private issueSession(user: UserRow): LoginResult {
     const token = randomBytes(32).toString("base64url");
     const now = Date.now();
     const sessionId = randomUUID();
@@ -133,6 +181,17 @@ export class AuthService {
   }
 }
 
+function parseEd25519PublicKey(value: string) {
+  if (value.length < 32 || value.length > 512 || !/^[A-Za-z0-9_-]+$/.test(value)) {
+    throw new AuthFailure("INVALID_CREDENTIALS", "public key format is invalid");
+  }
+  try {
+    return createPublicKey({ key: Buffer.from(value, "base64url"), format: "der", type: "spki" });
+  } catch {
+    throw new AuthFailure("INVALID_CREDENTIALS", "public key format is invalid");
+  }
+}
+
 function hashToken(token: string): string {
   return createHash("sha256").update(token, "utf8").digest("hex");
 }
@@ -146,7 +205,7 @@ function validateUsername(username: string): void {
 }
 
 function validatePassword(password: string): void {
-  if (password.length < 10 || password.length > 256) throw new Error("password must contain 10 to 256 characters");
+  if (password.length < 4 || password.length > 256) throw new Error("password must contain 4 to 256 characters");
 }
 
 function validateDisplayName(displayName: string): string {

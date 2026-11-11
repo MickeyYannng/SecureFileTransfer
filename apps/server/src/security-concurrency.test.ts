@@ -27,9 +27,10 @@ test("WSS security and concurrent multi-user transfers", async (t) => {
   const server = await startServer({
     port: 0, databasePath: ":memory:", storageRoot, tls: { cert: tls.cert, key: tls.key },
     allowedOrigins: [origin], maxConnections: 20, maxActiveUploadsPerUser: 3, maxActiveDownloadsPerUser: 3,
+    normalBandwidthBytesPerSecond: 1024 * 1024, vipBandwidthBytesPerSecond: 5 * 1024 * 1024,
     initialUsers: [
       { username: "Alice", password: alicePassword, displayName: "Alice" },
-      { username: "Bob", password: bobPassword, displayName: "Bob" },
+      { username: "Bob", password: bobPassword, displayName: "Bob", role: "vip" },
     ], logger: { info() {}, warn() {}, error() {} },
   });
   const url = `wss://${server.host}:${server.port}/ws`;
@@ -68,6 +69,19 @@ test("WSS security and concurrent multi-user transfers", async (t) => {
     aliceContents.forEach((content, index) => assert.deepEqual(downloaded[index], content));
     assert.deepEqual(downloaded[3], bobContent);
     assert.equal((await aliceClients[0]!.request("AUTH_ME", {})).type, "AUTH_ME_RESULT");
+  });
+
+  await t.test("applies a higher server-side transfer rate to VIP users", async () => {
+    const content = deterministicBytes(1024 * 1024);
+    const alice = await SecureTransferClient.connect(url, tls.ca); clients.push(alice); await alice.login("Alice", alicePassword);
+    const bob = await SecureTransferClient.connect(url, tls.ca); clients.push(bob); await bob.login("Bob", bobPassword);
+    const aliceStarted = performance.now();
+    await alice.upload("normal-rate.bin", content);
+    const aliceDuration = performance.now() - aliceStarted;
+    const bobStarted = performance.now();
+    await bob.upload("vip-rate.bin", content);
+    const bobDuration = performance.now() - bobStarted;
+    assert.ok(aliceDuration > bobDuration * 2, `expected normal ${aliceDuration}ms to be slower than VIP ${bobDuration}ms`);
   });
 
   await t.test("enforces connection and login limits", async () => {

@@ -28,6 +28,9 @@ export interface RuntimeConfig {
   maxConnections: number;
   loginMaxAttempts: number;
   loginWindowMs: number;
+  normalBandwidthBytesPerSecond: number;
+  vipBandwidthBytesPerSecond: number;
+  uploadResumeTtlMs: number;
 }
 
 export function loadRuntimeConfig(environment: NodeJS.ProcessEnv = process.env): RuntimeConfig {
@@ -56,6 +59,9 @@ export function loadRuntimeConfig(environment: NodeJS.ProcessEnv = process.env):
     maxConnections: positiveInteger(environment.SFT_MAX_CONNECTIONS, 100),
     loginMaxAttempts: positiveInteger(environment.SFT_LOGIN_MAX_ATTEMPTS, 5),
     loginWindowMs: positiveInteger(environment.SFT_LOGIN_WINDOW_MS, 60_000),
+    normalBandwidthBytesPerSecond: positiveInteger(environment.SFT_NORMAL_BANDWIDTH_BPS, 1024 * 1024),
+    vipBandwidthBytesPerSecond: positiveInteger(environment.SFT_VIP_BANDWIDTH_BPS, 5 * 1024 * 1024),
+    uploadResumeTtlMs: positiveInteger(environment.SFT_UPLOAD_RESUME_TTL_MS, 10 * 60_000),
   };
 }
 

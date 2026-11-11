@@ -22,6 +22,11 @@ export const CONTROL_MESSAGE_TYPES = [
   "HEARTBEAT_PING",
   "HEARTBEAT_PONG",
   "AUTH_LOGIN",
+  "AUTH_KEY_CHALLENGE",
+  "AUTH_KEY_CHALLENGE_RESULT",
+  "AUTH_KEY_RESPONSE",
+  "AUTH_PUBLIC_KEY_REGISTER",
+  "AUTH_PUBLIC_KEY_REGISTERED",
   "AUTH_TOKEN",
   "AUTH_SUCCESS",
   "AUTH_LOGOUT",
@@ -37,6 +42,8 @@ export const CONTROL_MESSAGE_TYPES = [
   "UPLOAD_COMPLETE",
   "UPLOAD_ABORT",
   "UPLOAD_ABORTED",
+  "UPLOAD_PAUSE",
+  "UPLOAD_PAUSED",
   "UPLOAD_ERROR",
   "DOWNLOAD_INIT",
   "DOWNLOAD_READY",
@@ -138,6 +145,7 @@ export interface UploadInitPayload {
   path: string;
   fileSize: number;
   fileSha256: string;
+  resumeTransferId?: string;
 }
 
 export interface UploadReadyPayload {
@@ -173,6 +181,7 @@ export interface UploadErrorPayload extends ErrorPayload {
 
 export interface DownloadInitPayload {
   path: string;
+  offset?: number;
 }
 
 export interface DownloadReadyPayload {

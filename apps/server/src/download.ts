@@ -13,6 +13,7 @@ import {
   type PublicUser,
 } from "@sft/protocol";
 import { StorageFailure, StorageService } from "./storage.js";
+import type { BandwidthLimiter } from "./bandwidth.js";
 
 export type DownloadState = "initializing" | "sending" | "awaiting-ack" | "awaiting-complete" | "completed" | "cancelled" | "failed";
 
@@ -41,6 +42,7 @@ export interface DownloadManagerOptions {
   ackTimeoutMs: number;
   maxActiveDownloadsGlobal: number;
   maxActiveDownloadsPerUser: number;
+  bandwidthLimiter?: BandwidthLimiter;
 }
 
 export type DownloadAction =
@@ -63,6 +65,7 @@ interface DownloadTask {
   identity: FileIdentity;
   timer?: NodeJS.Timeout;
   onTimeout: (failure: DownloadFailure) => void;
+  userRole: string;
 }
 
 interface FileIdentity {
@@ -90,6 +93,7 @@ export class DownloadManager {
     user: PublicUser,
     logicalPath: string,
     onTimeout: (failure: DownloadFailure) => void,
+    startOffset = 0,
   ): Promise<DownloadReadyPayload> {
     await this.reserveSlot(connectionId, user.id);
     let fileHandle: FileHandle | undefined;
@@ -105,6 +109,9 @@ export class DownloadManager {
         throw new DownloadFailure("FILE_TOO_LARGE", "file exceeds the configured download limit");
       }
       const fileSha256 = await hashFileHandle(fileHandle, fileSize);
+      if (!Number.isSafeInteger(startOffset) || startOffset < 0 || startOffset > fileSize) {
+        throw new DownloadFailure("INVALID_ACK", "resume offset is outside the file", undefined);
+      }
       const after = await fileHandle.stat({ bigint: true });
       const pathStats = await stat(canonicalPath, { bigint: true });
       if (!sameIdentity(before, after) || !sameIdentity(after, pathStats)) {
@@ -120,13 +127,14 @@ export class DownloadManager {
         canonicalPath,
         fileSize,
         fileSha256,
-        expectedOffset: 0,
-        pendingNextOffset: 0,
+        expectedOffset: startOffset,
+        pendingNextOffset: startOffset,
         state: "sending",
         fileHandle,
-        sentHasher: createHash("sha256"),
+        sentHasher: await hashPrefix(fileHandle, startOffset),
         identity: identityOf(after),
         onTimeout,
+        userRole: user.role,
       };
       fileHandle = undefined;
       this.tasks.set(transferId, task);
@@ -141,7 +149,7 @@ export class DownloadManager {
         fileSize,
         fileSha256,
         chunkSize: this.options.chunkSize,
-        nextOffset: 0,
+        nextOffset: startOffset,
       };
     } catch (error) {
       await fileHandle?.close().catch(() => undefined);
@@ -162,6 +170,7 @@ export class DownloadManager {
       const length = Math.min(this.options.chunkSize, task.fileSize - task.expectedOffset);
       const payload = Buffer.allocUnsafe(length);
       await readExactly(task.fileHandle, payload, task.expectedOffset);
+      await this.options.bandwidthLimiter?.throttle(task.userId, task.userRole, payload.byteLength);
       task.sentHasher.update(payload);
       task.pendingNextOffset = task.expectedOffset + payload.byteLength;
       task.state = "awaiting-ack";
@@ -368,6 +377,20 @@ async function hashFileHandle(handle: FileHandle, fileSize: number): Promise<str
     offset += bytesRead;
   }
   return hasher.digest("hex");
+}
+
+async function hashPrefix(handle: FileHandle, length: number): Promise<Hash> {
+  const hasher = createHash("sha256");
+  const buffer = Buffer.allocUnsafe(Math.min(1024 * 1024, Math.max(length, 1)));
+  let offset = 0;
+  while (offset < length) {
+    const wanted = Math.min(buffer.byteLength, length - offset);
+    const { bytesRead } = await handle.read(buffer, 0, wanted, offset);
+    if (bytesRead <= 0) throw new DownloadFailure("SOURCE_CHANGED", "download source ended while restoring hash state");
+    hasher.update(buffer.subarray(0, bytesRead));
+    offset += bytesRead;
+  }
+  return hasher;
 }
 
 async function readExactly(handle: FileHandle, target: Uint8Array, position: number): Promise<void> {

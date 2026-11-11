@@ -80,6 +80,12 @@ export class AppDatabase {
       );
   }
 
+  updateSeedUser(userId: string, passwordHash: string, role: string, now: number): void {
+    this.connection.prepare(
+      "UPDATE users SET password_hash = ?, role = ?, updated_at = ? WHERE id = ?",
+    ).run(passwordHash, role, now, userId);
+  }
+
   insertSession(input: {
     id: string;
     tokenHash: string;
@@ -134,6 +140,21 @@ export class AppDatabase {
     this.connection
       .prepare("UPDATE sessions SET revoked_at = COALESCE(revoked_at, ?) WHERE user_id = ?")
       .run(now, userId);
+  }
+
+  upsertPublicKey(userId: string, publicKeySpki: string, now: number): void {
+    this.connection.prepare(
+      `INSERT INTO user_public_keys (user_id, public_key_spki, created_at, updated_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET public_key_spki = excluded.public_key_spki, updated_at = excluded.updated_at`,
+    ).run(userId, publicKeySpki, now, now);
+  }
+
+  findPublicKeyByUsername(username: string): { user_id: string; public_key_spki: string } | undefined {
+    return this.connection.prepare(
+      `SELECT k.user_id, k.public_key_spki FROM user_public_keys k
+       JOIN users u ON u.id = k.user_id WHERE u.username = ? COLLATE NOCASE`,
+    ).get(username) as { user_id: string; public_key_spki: string } | undefined;
   }
 
   deleteExpiredSessions(now: number): void {

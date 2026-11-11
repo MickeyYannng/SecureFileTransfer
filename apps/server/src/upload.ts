@@ -11,8 +11,9 @@ import {
   type UploadReadyPayload,
 } from "@sft/protocol";
 import { StorageFailure, StorageService } from "./storage.js";
+import type { BandwidthLimiter } from "./bandwidth.js";
 
-export type UploadState = "initialized" | "receiving" | "verifying" | "completed" | "cancelled" | "failed";
+export type UploadState = "initialized" | "receiving" | "paused" | "verifying" | "completed" | "cancelled" | "failed";
 
 export class UploadFailure extends Error {
   constructor(
@@ -41,6 +42,8 @@ export interface UploadManagerOptions {
   chunkSize: number;
   maxActiveUploadsGlobal: number;
   maxActiveUploadsPerUser: number;
+  resumeTtlMs?: number;
+  bandwidthLimiter?: BandwidthLimiter;
 }
 
 interface UploadTask {
@@ -57,6 +60,7 @@ interface UploadTask {
   fileHandle: FileHandle;
   hasher: Hash;
   handleClosed: boolean;
+  resumeTimer?: NodeJS.Timeout;
 }
 
 export class UploadManager {
@@ -79,9 +83,30 @@ export class UploadManager {
     logicalPath: string,
     fileSize: number,
     fileSha256: string,
+    resumeTransferId?: string,
   ): Promise<UploadReadyPayload> {
     return this.withLock(async () => {
       validateUploadDeclaration(fileSize, fileSha256);
+      if (resumeTransferId) {
+        const task = this.tasks.get(resumeTransferId);
+        if (!task || task.userId !== user.id || task.state !== "paused") {
+          throw new UploadFailure("UPLOAD_NOT_FOUND", "resumable upload task does not exist", resumeTransferId);
+        }
+        if (task.logicalPath !== logicalPath || task.fileSize !== fileSize || task.declaredSha256 !== fileSha256.toLowerCase()) {
+          throw new UploadFailure("INVALID_INIT", "resume metadata does not match the original upload", resumeTransferId);
+        }
+        if ((this.tasksByConnection.get(connectionId)?.size ?? 0) >= this.options.maxActiveUploadsPerUser) {
+          throw new UploadFailure("TOO_MANY_TASKS", "connection upload task limit reached");
+        }
+        if (task.resumeTimer) clearTimeout(task.resumeTimer);
+        delete task.resumeTimer;
+        task.connectionId = connectionId;
+        task.state = "receiving";
+        const connectionSet = this.tasksByConnection.get(connectionId) ?? new Set<string>();
+        connectionSet.add(task.transferId);
+        this.tasksByConnection.set(connectionId, connectionSet);
+        return { transferId: task.transferId, chunkSize: this.options.chunkSize, nextOffset: task.expectedOffset };
+      }
       const connectionTasks = this.tasksByConnection.get(connectionId)?.size ?? 0;
       if (connectionTasks >= this.options.maxActiveUploadsPerUser) {
         throw new UploadFailure("TOO_MANY_TASKS", "connection upload task limit reached");
@@ -189,6 +214,8 @@ export class UploadManager {
         throw new UploadFailure("HASH_MISMATCH", "chunk SHA-256 does not match", task.transferId);
       }
 
+      await this.options.bandwidthLimiter?.throttle(user.id, user.role, frame.payload.byteLength);
+
       await writeAll(task.fileHandle, frame.payload, task.expectedOffset);
       await task.fileHandle.sync();
       task.hasher.update(frame.payload);
@@ -252,6 +279,20 @@ export class UploadManager {
     this.releaseTask(task);
   }
 
+  async pause(connectionId: string, userId: string, transferId: string): Promise<number> {
+    const task = this.requireTask(transferId, connectionId, userId);
+    if (task.state !== "receiving") throw new UploadFailure("INVALID_INIT", "upload cannot be paused", transferId);
+    task.state = "paused";
+    const connectionSet = this.tasksByConnection.get(connectionId);
+    connectionSet?.delete(transferId);
+    if (connectionSet?.size === 0) this.tasksByConnection.delete(connectionId);
+    task.connectionId = "";
+    const ttl = this.options.resumeTtlMs ?? 10 * 60_000;
+    task.resumeTimer = setTimeout(() => { void this.failTask(task); }, ttl);
+    task.resumeTimer.unref();
+    return task.expectedOffset;
+  }
+
   async abortByConnection(connectionId: string): Promise<void> {
     const transferIds = [...(this.tasksByConnection.get(connectionId) ?? [])];
     await Promise.all(transferIds.map(async (transferId) => {
@@ -294,6 +335,7 @@ export class UploadManager {
   }
 
   private releaseTask(task: UploadTask): void {
+    if (task.resumeTimer) clearTimeout(task.resumeTimer);
     if (!this.tasks.delete(task.transferId)) return;
     const connectionSet = this.tasksByConnection.get(task.connectionId);
     connectionSet?.delete(task.transferId);

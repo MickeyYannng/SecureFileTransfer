@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
 import { mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -72,6 +72,31 @@ test("Phase 2.1 authentication, isolation, paths, sessions, and heartbeat", asyn
     const me = await aliceClient.request("AUTH_ME", {});
     assert.equal(me.type, "AUTH_ME_RESULT");
     assert.equal(record(record(me.payload).user).id, aliceId);
+  });
+
+  await t.test("Ed25519 challenge login accepts a valid signature and rejects a wrong signature", async () => {
+    const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+    const publicKeySpki = publicKey.export({ format: "der", type: "spki" }).toString("base64url");
+    assert.equal((await aliceClient.request("AUTH_PUBLIC_KEY_REGISTER", { publicKeySpki })).type, "AUTH_PUBLIC_KEY_REGISTERED");
+
+    const invalidClient = await makeClient();
+    const invalidChallenge = await invalidClient.request("AUTH_KEY_CHALLENGE", { username: "Alice" });
+    assert.equal(invalidChallenge.type, "AUTH_KEY_CHALLENGE_RESULT");
+    assertErrorCode(await invalidClient.request("AUTH_KEY_RESPONSE", {
+      challengeId: record(invalidChallenge.payload).challengeId,
+      signature: Buffer.alloc(64).toString("base64url"),
+    }), ERROR_CODES.invalidCredentials);
+
+    const keyClient = await makeClient();
+    const challenge = await keyClient.request("AUTH_KEY_CHALLENGE", { username: "Alice" });
+    const challengePayload = record(challenge.payload);
+    const signature = sign(null, Buffer.from(challengePayload.challenge as string, "base64url"), privateKey).toString("base64url");
+    const authenticated = await keyClient.request("AUTH_KEY_RESPONSE", {
+      challengeId: challengePayload.challengeId,
+      signature,
+    });
+    assert.equal(authenticated.type, "AUTH_SUCCESS");
+    assert.equal(record(record(authenticated.payload).user).username, "Alice");
   });
 
   await t.test("wrong password and SQL injection input cannot authenticate", async () => {

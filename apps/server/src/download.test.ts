@@ -86,6 +86,43 @@ test("Phase 2.3 single-file download integration", async (t) => {
     assert.equal(sha256Hex(downloaded), sha256Hex(content));
   });
 
+  await t.test("reconnects and resumes a download from the acknowledged offset", async () => {
+    const content = deterministicBytes(chunkSize * 3 + 77);
+    await writeFile(join(storageRoot, "users", aliceId, "resumed-download.bin"), content);
+    const first = await makeClient("Alice");
+    const ready = await first.request("DOWNLOAD_INIT", { path: "resumed-download.bin" });
+    assert.equal(ready.type, "DOWNLOAD_READY");
+    const firstId = transferId(ready);
+    const firstChunk = await first.nextBinary();
+    const offset = firstChunk.payload.byteLength;
+    assert.deepEqual(Buffer.from(firstChunk.payload), content.subarray(0, offset));
+    first.send("DOWNLOAD_ACK", { transferId: firstId, nextOffset: offset });
+    first.close();
+    await delay(30);
+
+    const resumed = await makeClient("Alice");
+    const resumedReady = await resumed.request("DOWNLOAD_INIT", { path: "resumed-download.bin", offset });
+    assert.equal(resumedReady.type, "DOWNLOAD_READY");
+    assert.equal(record(resumedReady.payload).nextOffset, offset);
+    const resumedId = transferId(resumedReady);
+    const chunks: Buffer[] = [content.subarray(0, offset)];
+    let received = offset;
+    while (received < content.length) {
+      const frame = await resumed.nextBinary();
+      assert.equal(frame.header.offset, BigInt(received));
+      chunks.push(Buffer.from(frame.payload));
+      received += frame.payload.byteLength;
+      resumed.send("DOWNLOAD_ACK", { transferId: resumedId, nextOffset: received });
+    }
+    assert.equal((await resumed.nextControl()).type, "DOWNLOAD_FINISH");
+    const digest = sha256Hex(Buffer.concat(chunks));
+    const completed = await resumed.request("DOWNLOAD_COMPLETE", {
+      transferId: resumedId, success: true, receivedSize: received, fileSha256: digest,
+    });
+    assert.equal(completed.type, "DOWNLOAD_COMPLETE");
+    assert.equal(digest, sha256Hex(content));
+  });
+
   await t.test("downloads content previously committed by the upload protocol", async () => {
     const content = deterministicBytes(chunkSize * 2 + 123);
     await alice.upload("roundtrip.bin", content);

@@ -29,12 +29,14 @@ import { AppDatabase } from "./database.js";
 import { StorageFailure, StorageService } from "./storage.js";
 import { UploadFailure, UploadManager } from "./upload.js";
 import { DownloadFailure, DownloadManager, type DownloadAction } from "./download.js";
+import { BandwidthLimiter } from "./bandwidth.js";
 
 export interface InitialUser {
   id?: string;
   username: string;
   password: string;
   displayName: string;
+  role?: string;
   quotaBytes?: number;
   maxFiles?: number;
 }
@@ -62,6 +64,9 @@ export interface ServerOptions {
   maxConnections?: number;
   loginMaxAttempts?: number;
   loginWindowMs?: number;
+  normalBandwidthBytesPerSecond?: number;
+  vipBandwidthBytesPerSecond?: number;
+  uploadResumeTtlMs?: number;
   initialUsers?: InitialUser[];
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
@@ -113,6 +118,9 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
   const maxConnections = options.maxConnections ?? 100;
   const loginMaxAttempts = options.loginMaxAttempts ?? 5;
   const loginWindowMs = options.loginWindowMs ?? 60_000;
+  const normalBandwidthBytesPerSecond = options.normalBandwidthBytesPerSecond ?? 1024 * 1024;
+  const vipBandwidthBytesPerSecond = options.vipBandwidthBytesPerSecond ?? 5 * 1024 * 1024;
+  const uploadResumeTtlMs = options.uploadResumeTtlMs ?? 10 * 60_000;
   const logger = options.logger ?? console;
 
   if (heartbeatIntervalMs <= 0 || heartbeatTimeoutMs <= heartbeatIntervalMs) {
@@ -136,16 +144,20 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
     defaultMaxFiles,
   });
   await storage.initialize();
+  const bandwidthLimiter = new BandwidthLimiter(normalBandwidthBytesPerSecond, vipBandwidthBytesPerSecond);
   const upload = new UploadManager(storage, {
     chunkSize: uploadChunkSize,
     maxActiveUploadsGlobal,
     maxActiveUploadsPerUser,
+    resumeTtlMs: uploadResumeTtlMs,
+    bandwidthLimiter,
   });
   const download = new DownloadManager(storage, {
     chunkSize: downloadChunkSize,
     ackTimeoutMs: downloadAckTimeoutMs,
     maxActiveDownloadsGlobal,
     maxActiveDownloadsPerUser,
+    bandwidthLimiter,
   });
   for (const initialUser of options.initialUsers ?? []) {
     const result = await auth.createUser(initialUser);
@@ -155,7 +167,7 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
   const app = express();
   app.disable("x-powered-by");
   app.get("/health", (_request, response) => {
-    response.json({ status: "ok", protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, phase: "2.3" });
+    response.json({ status: "ok", protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, phase: "complete" });
   });
 
   const httpServer = options.tls ? createHttpsServer(options.tls, app) : createServer(app);
@@ -389,6 +401,30 @@ async function handleIncomingMessage(
         send(socket, createControlMessage("AUTH_SUCCESS", message.requestId, payload));
         return;
       }
+      case "AUTH_KEY_CHALLENGE": {
+        if (state.sessionId) throw new ProtocolFailure("connection is already authenticated");
+        if (!recordLoginAttempt(loginLimiter, state.clientAddress)) {
+          sendError(socket, message.requestId, ERROR_CODES.rateLimited, "too many login attempts; try again later", true);
+          return;
+        }
+        const username = requiredString(message.payload, "username", 128);
+        const challenge = auth.createPublicKeyChallenge(username);
+        send(socket, createControlMessage("AUTH_KEY_CHALLENGE_RESULT", message.requestId, challenge));
+        return;
+      }
+      case "AUTH_KEY_RESPONSE": {
+        if (state.sessionId) throw new ProtocolFailure("connection is already authenticated");
+        const challengeId = requiredString(message.payload, "challengeId", 36);
+        const signature = requiredString(message.payload, "signature", 256);
+        const login = auth.authenticatePublicKey(challengeId, signature);
+        loginLimiter.attempts.delete(state.clientAddress);
+        state.sessionId = login.sessionId;
+        await storage.ensureUserRoot(login.user.id);
+        send(socket, createControlMessage("AUTH_SUCCESS", message.requestId, {
+          token: login.token, user: login.user, expiresAt: login.expiresAt,
+        } satisfies AuthSuccessPayload));
+        return;
+      }
       case "AUTH_TOKEN": {
         if (state.sessionId) throw new ProtocolFailure("connection is already authenticated");
         const token = requiredString(message.payload, "token", 256);
@@ -403,6 +439,13 @@ async function handleIncomingMessage(
         const session = requireCurrentSession(state, auth);
         const payload: AuthMeResultPayload = { user: session.user, expiresAt: session.expiresAt };
         send(socket, createControlMessage("AUTH_ME_RESULT", message.requestId, payload));
+        return;
+      }
+      case "AUTH_PUBLIC_KEY_REGISTER": {
+        const session = requireCurrentSession(state, auth);
+        const publicKeySpki = requiredString(message.payload, "publicKeySpki", 512);
+        auth.registerPublicKey(session.sessionId, publicKeySpki);
+        send(socket, createControlMessage("AUTH_PUBLIC_KEY_REGISTERED", message.requestId, {}));
         return;
       }
       case "AUTH_LOGOUT": {
@@ -426,7 +469,9 @@ async function handleIncomingMessage(
         const logicalPath = requiredString(message.payload, "path", 1024);
         const fileSize = requiredNonNegativeInteger(message.payload, "fileSize");
         const fileSha256 = requiredString(message.payload, "fileSha256", 64);
-        const ready = await upload.initialize(state.connectionId, session.user, logicalPath, fileSize, fileSha256);
+        const resumeTransferId = hasStringField(message.payload, "resumeTransferId")
+          ? requiredString(message.payload, "resumeTransferId", 36) : undefined;
+        const ready = await upload.initialize(state.connectionId, session.user, logicalPath, fileSize, fileSha256, resumeTransferId);
         send(socket, createControlMessage("UPLOAD_READY", message.requestId, ready));
         return;
       }
@@ -444,12 +489,20 @@ async function handleIncomingMessage(
         send(socket, createControlMessage("UPLOAD_ABORTED", message.requestId, { transferId }));
         return;
       }
+      case "UPLOAD_PAUSE": {
+        const session = requireCurrentSession(state, auth);
+        const transferId = requiredString(message.payload, "transferId", 36);
+        const persistedOffset = await upload.pause(state.connectionId, session.user.id, transferId);
+        send(socket, createControlMessage("UPLOAD_PAUSED", message.requestId, { transferId, persistedOffset }));
+        return;
+      }
       case "DOWNLOAD_INIT": {
         const session = requireCurrentSession(state, auth);
         const logicalPath = requiredString(message.payload, "path", 1024);
+        const offset = optionalNonNegativeInteger(message.payload, "offset") ?? 0;
         const ready = await download.initialize(state.connectionId, session.user, logicalPath, (failure) => {
           sendDownloadError(socket, randomUUID(), downloadErrorCode(failure.code), failure.message, false, failure.transferId);
-        });
+        }, offset);
         // Hash preparation may take time for a large file; do not send metadata or bytes
         // unless the connection-bound session is still valid after that work completes.
         requireCurrentSession(state, auth);
@@ -491,6 +544,8 @@ async function handleIncomingMessage(
       }
       case "HELLO_ACK":
       case "AUTH_SUCCESS":
+      case "AUTH_KEY_CHALLENGE_RESULT":
+      case "AUTH_PUBLIC_KEY_REGISTERED":
       case "AUTH_LOGOUT_ACK":
       case "AUTH_ME_RESULT":
       case "FILE_LIST_RESULT":
@@ -498,6 +553,7 @@ async function handleIncomingMessage(
       case "UPLOAD_ACK":
       case "UPLOAD_COMPLETE":
       case "UPLOAD_ABORTED":
+      case "UPLOAD_PAUSED":
       case "UPLOAD_ERROR":
       case "DOWNLOAD_READY":
       case "DOWNLOAD_FINISH":
@@ -614,6 +670,16 @@ function requiredNonNegativeInteger(value: unknown, field: string): number {
   return candidate;
 }
 
+function optionalNonNegativeInteger(value: unknown, field: string): number | undefined {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new ProtocolFailure("payload must be an object");
+  const fieldValue = (value as Record<string, unknown>)[field];
+  if (fieldValue === undefined) return undefined;
+  if (typeof fieldValue !== "number" || !Number.isSafeInteger(fieldValue) || fieldValue < 0) {
+    throw new ProtocolFailure(`${field} must be a non-negative safe integer`);
+  }
+  return fieldValue;
+}
+
 function requiredBoolean(value: unknown, field: string): boolean {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new ProtocolFailure(`${field} must be a boolean`);
@@ -682,7 +748,7 @@ function downloadErrorCode(code: DownloadFailure["code"]): string {
 }
 
 function isUploadControlType(type: ControlMessage<unknown>["type"]): boolean {
-  return type === "UPLOAD_INIT" || type === "UPLOAD_FINISH" || type === "UPLOAD_ABORT";
+  return type === "UPLOAD_INIT" || type === "UPLOAD_FINISH" || type === "UPLOAD_ABORT" || type === "UPLOAD_PAUSE";
 }
 
 function isDownloadControlType(type: ControlMessage<unknown>["type"]): boolean {
