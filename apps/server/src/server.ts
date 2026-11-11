@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type Server as HttpServer } from "node:http";
+import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import { fileURLToPath } from "node:url";
 import express from "express";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
@@ -56,6 +57,11 @@ export interface ServerOptions {
   downloadAckTimeoutMs?: number;
   maxActiveDownloadsGlobal?: number;
   maxActiveDownloadsPerUser?: number;
+  tls?: { cert: string | Buffer; key: string | Buffer };
+  allowedOrigins?: string[];
+  maxConnections?: number;
+  loginMaxAttempts?: number;
+  loginWindowMs?: number;
   initialUsers?: InitialUser[];
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
@@ -70,12 +76,14 @@ interface ConnectionState {
   rateWindowStartedAt: number;
   messageChain: Promise<void>;
   pendingMessages: number;
+  clientAddress: string;
 }
 
 export interface RunningServer {
   host: string;
   port: number;
-  httpServer: HttpServer;
+  httpServer: HttpServer | HttpsServer;
+  secure: boolean;
   close(): Promise<void>;
 }
 
@@ -96,11 +104,15 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
   const defaultMaxFiles = options.defaultMaxFiles ?? 1_000;
   const uploadChunkSize = options.uploadChunkSize ?? 256 * 1024;
   const maxActiveUploadsGlobal = options.maxActiveUploadsGlobal ?? 32;
-  const maxActiveUploadsPerUser = options.maxActiveUploadsPerUser ?? 1;
+  const maxActiveUploadsPerUser = options.maxActiveUploadsPerUser ?? 3;
   const downloadChunkSize = options.downloadChunkSize ?? 256 * 1024;
   const downloadAckTimeoutMs = options.downloadAckTimeoutMs ?? 15_000;
   const maxActiveDownloadsGlobal = options.maxActiveDownloadsGlobal ?? 32;
-  const maxActiveDownloadsPerUser = options.maxActiveDownloadsPerUser ?? 1;
+  const maxActiveDownloadsPerUser = options.maxActiveDownloadsPerUser ?? 3;
+  const allowedOrigins = new Set(options.allowedOrigins ?? []);
+  const maxConnections = options.maxConnections ?? 100;
+  const loginMaxAttempts = options.loginMaxAttempts ?? 5;
+  const loginWindowMs = options.loginWindowMs ?? 60_000;
   const logger = options.logger ?? console;
 
   if (heartbeatIntervalMs <= 0 || heartbeatTimeoutMs <= heartbeatIntervalMs) {
@@ -114,6 +126,7 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
     throw new Error("download chunk size must be between 16 KiB and 1 MiB");
   }
   if (downloadAckTimeoutMs < 10) throw new Error("download ACK timeout must be at least 10 ms");
+  if (maxConnections < 1 || loginMaxAttempts < 1 || loginWindowMs < 1) throw new Error("security limits must be positive");
 
   const database = new AppDatabase(options.databasePath ?? defaultDatabasePath);
   const auth = await AuthService.create(database, { sessionTtlMs, defaultQuotaBytes, defaultMaxFiles });
@@ -145,17 +158,32 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
     response.json({ status: "ok", protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, phase: "2.3" });
   });
 
-  const httpServer = createServer(app);
+  const httpServer = options.tls ? createHttpsServer(options.tls, app) : createServer(app);
+  httpServer.requestTimeout = 30_000;
+  httpServer.headersTimeout = 15_000;
+  const loginAttempts = new Map<string, { count: number; resetAt: number }>();
   const webSocketServer = new WebSocketServer({
     server: httpServer,
     path: "/ws",
     maxPayload: Math.max(MAX_CONTROL_MESSAGE_BYTES, BINARY_HEADER_LENGTH + uploadChunkSize, BINARY_HEADER_LENGTH + downloadChunkSize),
     perMessageDeflate: false,
+    verifyClient(info, done) {
+      if (webSocketServer.clients.size >= maxConnections) {
+        done(false, 503, "connection limit reached");
+        return;
+      }
+      const origin = info.origin;
+      if (allowedOrigins.size > 0 && (!origin || !allowedOrigins.has(origin))) {
+        done(false, 403, "origin not allowed");
+        return;
+      }
+      done(true);
+    },
   });
   webSocketServer.on("error", () => logger.error("WebSocket server transport error"));
   const states = new WeakMap<WebSocket, ConnectionState>();
 
-  webSocketServer.on("connection", (socket) => {
+  webSocketServer.on("connection", (socket, request) => {
     const now = Date.now();
     const state: ConnectionState = {
       connectionId: randomUUID(),
@@ -165,6 +193,7 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
       rateWindowStartedAt: now,
       messageChain: Promise.resolve(),
       pendingMessages: 0,
+      clientAddress: request.socket.remoteAddress ?? "unknown",
     };
     states.set(socket, state);
 
@@ -190,6 +219,7 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
           heartbeatIntervalMs,
           heartbeatTimeoutMs,
           uploadChunkSize,
+          { attempts: loginAttempts, maxAttempts: loginMaxAttempts, windowMs: loginWindowMs },
         ))
         .catch(() => {
           logger.error(`Unhandled request failure on connection ${state.connectionId}`);
@@ -202,6 +232,11 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
       void upload.abortByConnection(state.connectionId);
       void download.abortByConnection(state.connectionId);
     });
+    const helloTimer = setTimeout(() => {
+      if (!state.helloComplete && socket.readyState === WebSocket.OPEN) socket.close(1008, "HELLO timeout");
+    }, 10_000);
+    helloTimer.unref();
+    socket.once("close", () => clearTimeout(helloTimer));
   });
 
   const heartbeatTimer = setInterval(() => {
@@ -240,12 +275,14 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
 
   const address = httpServer.address();
   if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-  logger.info(`SFT Phase 2.3 server listening on http://${host}:${address.port}`);
+  const scheme = options.tls ? "https" : "http";
+  logger.info(`SFT secure transfer server listening on ${scheme}://${host}:${address.port}`);
 
   return {
     host,
     port: address.port,
     httpServer,
+    secure: Boolean(options.tls),
     async close() {
       clearInterval(heartbeatTimer);
       for (const socket of webSocketServer.clients) {
@@ -276,6 +313,7 @@ async function handleIncomingMessage(
   heartbeatIntervalMs: number,
   heartbeatTimeoutMs: number,
   uploadChunkSize: number,
+  loginLimiter: { attempts: Map<string, { count: number; resetAt: number }>; maxAttempts: number; windowMs: number },
 ): Promise<void> {
   if (isBinary) {
     await handleUploadChunk(socket, state, data, auth, upload, uploadChunkSize);
@@ -333,9 +371,14 @@ async function handleIncomingMessage(
       }
       case "AUTH_LOGIN": {
         if (state.sessionId) throw new ProtocolFailure("connection is already authenticated");
+        if (!recordLoginAttempt(loginLimiter, state.clientAddress)) {
+          sendError(socket, message.requestId, ERROR_CODES.rateLimited, "too many login attempts; try again later", true);
+          return;
+        }
         const username = requiredString(message.payload, "username", 128);
         const password = requiredString(message.payload, "password", 512);
         const login = await auth.login(username, password);
+        loginLimiter.attempts.delete(state.clientAddress);
         state.sessionId = login.sessionId;
         await storage.ensureUserRoot(login.user.id);
         const payload: AuthSuccessPayload = {
@@ -380,9 +423,6 @@ async function handleIncomingMessage(
       }
       case "UPLOAD_INIT": {
         const session = requireCurrentSession(state, auth);
-        if (download.getTransferIdForConnection(state.connectionId)) {
-          throw new UploadFailure("TOO_MANY_TASKS", "this connection already has an active transfer");
-        }
         const logicalPath = requiredString(message.payload, "path", 1024);
         const fileSize = requiredNonNegativeInteger(message.payload, "fileSize");
         const fileSha256 = requiredString(message.payload, "fileSha256", 64);
@@ -406,9 +446,6 @@ async function handleIncomingMessage(
       }
       case "DOWNLOAD_INIT": {
         const session = requireCurrentSession(state, auth);
-        if (upload.getTransferIdForConnection(state.connectionId)) {
-          throw new DownloadFailure("TOO_MANY_TASKS", "this connection already has an active transfer");
-        }
         const logicalPath = requiredString(message.payload, "path", 1024);
         const ready = await download.initialize(state.connectionId, session.user, logicalPath, (failure) => {
           sendDownloadError(socket, randomUUID(), downloadErrorCode(failure.code), failure.message, false, failure.transferId);
@@ -712,6 +749,21 @@ function allowControlMessage(state: ConnectionState): boolean {
   }
   state.messagesInWindow += 1;
   return state.messagesInWindow <= CONTROL_RATE_LIMIT;
+}
+
+function recordLoginAttempt(
+  limiter: { attempts: Map<string, { count: number; resetAt: number }>; maxAttempts: number; windowMs: number },
+  key: string,
+): boolean {
+  const now = Date.now();
+  const current = limiter.attempts.get(key);
+  if (!current || current.resetAt <= now) {
+    limiter.attempts.set(key, { count: 1, resetAt: now + limiter.windowMs });
+    return true;
+  }
+  if (current.count >= limiter.maxAttempts) return false;
+  current.count += 1;
+  return true;
 }
 
 function isRateLimitExempt(type: ControlMessage<unknown>["type"]): boolean {

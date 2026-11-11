@@ -61,7 +61,7 @@ interface UploadTask {
 
 export class UploadManager {
   private readonly tasks = new Map<string, UploadTask>();
-  private readonly taskByConnection = new Map<string, string>();
+  private readonly tasksByConnection = new Map<string, Set<string>>();
   private readonly taskCountByUser = new Map<string, number>();
   private readonly reservedBytesByUser = new Map<string, number>();
   private readonly reservedFilesByUser = new Map<string, number>();
@@ -82,8 +82,9 @@ export class UploadManager {
   ): Promise<UploadReadyPayload> {
     return this.withLock(async () => {
       validateUploadDeclaration(fileSize, fileSha256);
-      if (this.taskByConnection.has(connectionId)) {
-        throw new UploadFailure("TOO_MANY_TASKS", "this connection already has an active upload");
+      const connectionTasks = this.tasksByConnection.get(connectionId)?.size ?? 0;
+      if (connectionTasks >= this.options.maxActiveUploadsPerUser) {
+        throw new UploadFailure("TOO_MANY_TASKS", "connection upload task limit reached");
       }
       if (this.tasks.size >= this.options.maxActiveUploadsGlobal) {
         throw new UploadFailure("TOO_MANY_TASKS", "server upload task limit reached");
@@ -145,7 +146,9 @@ export class UploadManager {
         handleClosed: false,
       };
       this.tasks.set(transferId, task);
-      this.taskByConnection.set(connectionId, transferId);
+      const connectionSet = this.tasksByConnection.get(connectionId) ?? new Set<string>();
+      connectionSet.add(transferId);
+      this.tasksByConnection.set(connectionId, connectionSet);
       this.taskCountByUser.set(user.id, userTaskCount + 1);
       this.reservedBytesByUser.set(user.id, reservedBytes + fileSize);
       this.reservedFilesByUser.set(user.id, reservedFiles + 1);
@@ -250,18 +253,19 @@ export class UploadManager {
   }
 
   async abortByConnection(connectionId: string): Promise<void> {
-    const transferId = this.taskByConnection.get(connectionId);
-    if (!transferId) return;
-    const task = this.tasks.get(transferId);
-    if (!task) return;
-    task.state = "cancelled";
-    await this.closeHandle(task);
-    await this.storage.removeTemporaryFile(task.temporaryPath);
-    this.releaseTask(task);
+    const transferIds = [...(this.tasksByConnection.get(connectionId) ?? [])];
+    await Promise.all(transferIds.map(async (transferId) => {
+      const task = this.tasks.get(transferId);
+      if (!task) return;
+      task.state = "cancelled";
+      await this.closeHandle(task);
+      await this.storage.removeTemporaryFile(task.temporaryPath);
+      this.releaseTask(task);
+    }));
   }
 
   getTransferIdForConnection(connectionId: string): string | undefined {
-    return this.taskByConnection.get(connectionId);
+    return this.tasksByConnection.get(connectionId)?.values().next().value;
   }
 
   private requireTask(transferId: string, connectionId: string, userId: string): UploadTask {
@@ -291,7 +295,9 @@ export class UploadManager {
 
   private releaseTask(task: UploadTask): void {
     if (!this.tasks.delete(task.transferId)) return;
-    this.taskByConnection.delete(task.connectionId);
+    const connectionSet = this.tasksByConnection.get(task.connectionId);
+    connectionSet?.delete(task.transferId);
+    if (connectionSet?.size === 0) this.tasksByConnection.delete(task.connectionId);
     const taskCount = Math.max(0, (this.taskCountByUser.get(task.userId) ?? 1) - 1);
     const reservedBytes = Math.max(0, (this.reservedBytesByUser.get(task.userId) ?? task.fileSize) - task.fileSize);
     const reservedFiles = Math.max(0, (this.reservedFilesByUser.get(task.userId) ?? 1) - 1);

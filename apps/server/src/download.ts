@@ -75,9 +75,9 @@ interface FileIdentity {
 
 export class DownloadManager {
   private readonly tasks = new Map<string, DownloadTask>();
-  private readonly taskByConnection = new Map<string, string>();
+  private readonly tasksByConnection = new Map<string, Set<string>>();
   private readonly taskCountByUser = new Map<string, number>();
-  private readonly reservedConnections = new Set<string>();
+  private readonly reservedByConnection = new Map<string, number>();
   private lock: Promise<void> = Promise.resolve();
 
   constructor(
@@ -130,8 +130,10 @@ export class DownloadManager {
       };
       fileHandle = undefined;
       this.tasks.set(transferId, task);
-      this.taskByConnection.set(connectionId, transferId);
-      this.reservedConnections.delete(connectionId);
+      const connectionSet = this.tasksByConnection.get(connectionId) ?? new Set<string>();
+      connectionSet.add(transferId);
+      this.tasksByConnection.set(connectionId, connectionSet);
+      this.decrementConnectionReservation(connectionId);
       return {
         transferId,
         path: logicalPath,
@@ -239,16 +241,17 @@ export class DownloadManager {
   }
 
   async abortByConnection(connectionId: string): Promise<void> {
-    const transferId = this.taskByConnection.get(connectionId);
-    if (!transferId) return;
-    const task = this.tasks.get(transferId);
-    if (!task) return;
-    task.state = "cancelled";
-    await this.closeAndRelease(task);
+    const transferIds = [...(this.tasksByConnection.get(connectionId) ?? [])];
+    await Promise.all(transferIds.map(async (transferId) => {
+      const task = this.tasks.get(transferId);
+      if (!task) return;
+      task.state = "cancelled";
+      await this.closeAndRelease(task);
+    }));
   }
 
   getTransferIdForConnection(connectionId: string): string | undefined {
-    return this.taskByConnection.get(connectionId);
+    return this.tasksByConnection.get(connectionId)?.values().next().value;
   }
 
   private async finishSending(task: DownloadTask): Promise<DownloadAction> {
@@ -304,32 +307,44 @@ export class DownloadManager {
     this.clearTimer(task);
     await task.fileHandle.close().catch(() => undefined);
     if (!this.tasks.delete(task.transferId)) return;
-    this.taskByConnection.delete(task.connectionId);
+    const connectionSet = this.tasksByConnection.get(task.connectionId);
+    connectionSet?.delete(task.transferId);
+    if (connectionSet?.size === 0) this.tasksByConnection.delete(task.connectionId);
     const count = Math.max(0, (this.taskCountByUser.get(task.userId) ?? 1) - 1);
     if (count === 0) this.taskCountByUser.delete(task.userId); else this.taskCountByUser.set(task.userId, count);
   }
 
   private async reserveSlot(connectionId: string, userId: string): Promise<void> {
     await this.withLock(async () => {
-      if (this.taskByConnection.has(connectionId) || this.reservedConnections.has(connectionId)) {
-        throw new DownloadFailure("TOO_MANY_TASKS", "this connection already has an active download");
+      const connectionCount = (this.tasksByConnection.get(connectionId)?.size ?? 0)
+        + (this.reservedByConnection.get(connectionId) ?? 0);
+      if (connectionCount >= this.options.maxActiveDownloadsPerUser) {
+        throw new DownloadFailure("TOO_MANY_TASKS", "connection download task limit reached");
       }
-      if (this.tasks.size + this.reservedConnections.size >= this.options.maxActiveDownloadsGlobal) {
+      const reservedTotal = [...this.reservedByConnection.values()].reduce((sum, count) => sum + count, 0);
+      if (this.tasks.size + reservedTotal >= this.options.maxActiveDownloadsGlobal) {
         throw new DownloadFailure("TOO_MANY_TASKS", "server download task limit reached");
       }
       const count = this.taskCountByUser.get(userId) ?? 0;
       if (count >= this.options.maxActiveDownloadsPerUser) {
         throw new DownloadFailure("TOO_MANY_TASKS", "user download task limit reached");
       }
-      this.reservedConnections.add(connectionId);
+      this.reservedByConnection.set(connectionId, (this.reservedByConnection.get(connectionId) ?? 0) + 1);
       this.taskCountByUser.set(userId, count + 1);
     });
   }
 
   private releaseReservedSlot(connectionId: string, userId: string): void {
-    if (!this.reservedConnections.delete(connectionId)) return;
+    if ((this.reservedByConnection.get(connectionId) ?? 0) === 0) return;
+    this.decrementConnectionReservation(connectionId);
     const count = Math.max(0, (this.taskCountByUser.get(userId) ?? 1) - 1);
     if (count === 0) this.taskCountByUser.delete(userId); else this.taskCountByUser.set(userId, count);
+  }
+
+  private decrementConnectionReservation(connectionId: string): void {
+    const remaining = Math.max(0, (this.reservedByConnection.get(connectionId) ?? 1) - 1);
+    if (remaining === 0) this.reservedByConnection.delete(connectionId);
+    else this.reservedByConnection.set(connectionId, remaining);
   }
 
   private async withLock<T>(operation: () => Promise<T>): Promise<T> {

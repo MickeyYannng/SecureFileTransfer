@@ -9,7 +9,7 @@
     "start": "node dist/index.js",
     "db:init": "tsx src/init-database.ts",
     "db:seed": "tsx src/init-database.ts --seed-test-users",
-    "test": "npm run build && node --test dist/server.test.js dist/upload.test.js dist/download.test.js",
+    "test": "npm run build && node --test dist/server.test.js dist/upload.test.js dist/download.test.js dist/security-concurrency.test.js",
     "test:slow-upload": "npm run build && node --test dist/upload.slow.test.js",
     "test:slow-download": "npm run build && node --test dist/download.slow.test.js"
   },

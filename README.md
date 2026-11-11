@@ -1,16 +1,19 @@
 # Secure File Transfer (Experiment 1B)
 
-This repository is being developed incrementally for UCAS *Software and System Security* Experiment 1B. Phase 2.3 provides authenticated custom-WebSocket single-file upload and download with bounded chunks, SHA-256 verification, explicit ACK/completion states, user isolation, and GUI progress/cancellation. TLS is intentionally deferred to Phase 3.
+This repository implements the UCAS *Software and System Security* Experiment 1B with HTTPS/WSS, custom chunked WebSocket upload/download, authentication, user isolation, SHA-256, heartbeat, and up to three concurrent GUI transfer tasks per user.
 
 ## Quick start on Windows 11
 
 ```powershell
 Copy-Item .env.example .env
 npm install
+npm run cert:generate
+powershell -ExecutionPolicy Bypass -File scripts\trust-dev-ca.ps1
+powershell -ExecutionPolicy Bypass -File scripts\configure-storage-acl.ps1
 npm run dev
 ```
 
-Open <http://localhost:5173>. The browser connects to `/ws` through Vite's development proxy, completes the custom `HELLO` exchange, and answers server heartbeat messages.
+Open <https://127.0.0.1:5173>. The browser validates the locally trusted development CA and connects directly to `wss://127.0.0.1:3000/ws`.
 
 ## Initialize Alice and Bob
 
@@ -37,7 +40,7 @@ npm run test:slow-upload --workspace @sft/server
 npm run test:slow-download --workspace @sft/server
 ```
 
-After login, upload from the panel or click **下载** beside a private file. Current Edge/Chrome use File System Access API plus an OPFS verified temporary file for bounded-memory downloads. Other browsers use a memory fallback limited to 32 MiB.
+After login, select multiple files for upload or click **下载** on several server files. The task list displays independent progress, speed, state, and cancellation. Edge/Chrome use File System Access API plus OPFS for bounded-memory downloads; other browsers use a 32 MiB fallback.
 
 See [`docs/requirements.md`](docs/requirements.md), [`docs/architecture.md`](docs/architecture.md), [`docs/protocol-draft.md`](docs/protocol-draft.md), [`docs/phase-plan.md`](docs/phase-plan.md), [`docs/phase-2.1.md`](docs/phase-2.1.md), [`docs/phase-2.2.md`](docs/phase-2.2.md), and [`docs/phase-2.3.md`](docs/phase-2.3.md).
 

@@ -65,6 +65,23 @@ let downloadTemporaryWritable: FileSystemWritableFileStream | undefined;
 let fallbackDownloadChunks: BlobPart[] = [];
 const FALLBACK_DOWNLOAD_LIMIT = 32 * 1024 * 1024;
 
+type TaskDirection = "upload" | "download";
+interface TransferTaskView {
+  id: string;
+  name: string;
+  direction: TaskDirection;
+  status: string;
+  progress: number;
+  speed: number;
+  message: string;
+  cancelled: boolean;
+}
+const batchSelectedFiles = ref<File[]>([]);
+const transferTasks = ref<TransferTaskView[]>([]);
+const taskControllers = new Map<string, { cancel(): Promise<void> }>();
+const uploadTaskViews = computed(() => transferTasks.value.filter((task) => task.direction === "upload"));
+const downloadTaskViews = computed(() => transferTasks.value.filter((task) => task.direction === "download"));
+
 let socket: WebSocket | undefined;
 let sessionToken: string | undefined;
 let reconnectTimer: number | undefined;
@@ -534,6 +551,323 @@ function selectFile(event: Event): void {
   uploadMessage.value = `${file.name} · ${formatBytes(file.size)}`;
 }
 
+function selectBatchFiles(event: Event): void {
+  const input = event.target as HTMLInputElement;
+  batchSelectedFiles.value = Array.from(input.files ?? []);
+}
+
+function startBatchUploads(): void {
+  if (!sessionToken || batchSelectedFiles.value.length === 0) return;
+  const files = [...batchSelectedFiles.value];
+  batchSelectedFiles.value = [];
+  let next = 0;
+  const runWorker = async () => {
+    while (next < files.length) {
+      const file = files[next++];
+      if (!file) continue;
+      const view = createTransferView(file.name, "upload");
+      const worker = new BatchUploadWorker(view, file, currentPath.value, sessionToken!, wsUrl.value);
+      taskControllers.set(view.id, worker);
+      await worker.run().finally(() => {
+        taskControllers.delete(view.id);
+        if (view.status === "completed") refreshFiles();
+      });
+    }
+  };
+  void Promise.all(Array.from({ length: Math.min(3, files.length) }, runWorker));
+}
+
+async function startBatchDownload(entry: FileListEntry): Promise<void> {
+  if (entry.type !== "file" || !sessionToken) return;
+  const active = downloadTaskViews.value.filter((task) => !["completed", "cancelled", "error"].includes(task.status)).length;
+  if (active >= 3) {
+    addLog("每个用户最多同时下载 3 个文件");
+    return;
+  }
+  const view = createTransferView(entry.name, "download");
+  try {
+    const target = await prepareBatchDownloadTarget(entry);
+    const logicalPath = currentPath.value ? `${currentPath.value}/${entry.name}` : entry.name;
+    const worker = new BatchDownloadWorker(view, logicalPath, entry.size, target, sessionToken, wsUrl.value);
+    taskControllers.set(view.id, worker);
+    await worker.run();
+  } catch (error) {
+    if (isAbortError(error)) {
+      view.status = "cancelled";
+      view.message = "已取消保存位置选择";
+    } else {
+      view.status = "error";
+      view.message = error instanceof Error ? error.message : "下载失败";
+    }
+  } finally {
+    taskControllers.delete(view.id);
+  }
+}
+
+function createTransferView(name: string, direction: TaskDirection): TransferTaskView {
+  const view = reactive<TransferTaskView>({
+    id: crypto.randomUUID(), name, direction, status: "queued", progress: 0, speed: 0,
+    message: direction === "upload" ? "等待上传" : "准备下载", cancelled: false,
+  });
+  transferTasks.value.unshift(view);
+  return view;
+}
+
+function cancelTransferTask(task: TransferTaskView): void {
+  task.cancelled = true;
+  void taskControllers.get(task.id)?.cancel();
+  if (task.status === "queued") {
+    task.status = "cancelled";
+    task.message = "已取消";
+  }
+}
+
+function clearFinishedTasks(): void {
+  transferTasks.value = transferTasks.value.filter((task) => !["completed", "cancelled", "error"].includes(task.status));
+}
+
+interface BatchDownloadTarget {
+  finalHandle?: FileSystemFileHandle;
+  root?: FileSystemDirectoryHandle;
+  temporaryHandle?: FileSystemFileHandle;
+  temporaryName?: string;
+  writable?: FileSystemWritableFileStream;
+  chunks: BlobPart[];
+}
+
+async function prepareBatchDownloadTarget(entry: FileListEntry): Promise<BatchDownloadTarget> {
+  const picker = (window as unknown as {
+    showSaveFilePicker?: (options: { suggestedName: string }) => Promise<FileSystemFileHandle>;
+  }).showSaveFilePicker;
+  const getDirectory = navigator.storage?.getDirectory?.bind(navigator.storage);
+  if (picker && getDirectory) {
+    const finalHandle = await picker({ suggestedName: entry.name });
+    const root = await getDirectory();
+    const temporaryName = `.sft-${crypto.randomUUID()}.part`;
+    const temporaryHandle = await root.getFileHandle(temporaryName, { create: true });
+    return { finalHandle, root, temporaryHandle, temporaryName, writable: await temporaryHandle.createWritable(), chunks: [] };
+  }
+  if (entry.size > FALLBACK_DOWNLOAD_LIMIT) throw new Error("浏览器兼容模式最多下载 32 MiB，请使用 Edge/Chrome");
+  return { chunks: [] };
+}
+
+class TaskProtocolSocket {
+  private socket?: WebSocket;
+  private readonly pending = new Map<string, { resolve(value: ReturnType<typeof parseControlMessage>): void; reject(error: Error): void }>();
+  private readonly events: Array<ArrayBuffer | ReturnType<typeof parseControlMessage>> = [];
+  private readonly eventWaiters: Array<(value: ArrayBuffer | ReturnType<typeof parseControlMessage>) => void> = [];
+
+  constructor(private readonly url: string, private readonly token: string) {}
+
+  async connect(): Promise<void> {
+    const socket = new WebSocket(this.url);
+    socket.binaryType = "arraybuffer";
+    this.socket = socket;
+    await new Promise<void>((resolvePromise, reject) => {
+      socket.addEventListener("open", () => resolvePromise(), { once: true });
+      socket.addEventListener("error", () => reject(new Error("任务 WebSocket 连接失败")), { once: true });
+    });
+    socket.addEventListener("message", (event) => {
+      if (event.data instanceof ArrayBuffer) { this.pushEvent(event.data); return; }
+      const message = parseControlMessage(String(event.data));
+      if (message.type === "HEARTBEAT_PING" && hasStringField(message.payload, "nonce")) {
+        this.send("HEARTBEAT_PONG", { nonce: message.payload.nonce }, message.requestId);
+        return;
+      }
+      const pending = this.pending.get(message.requestId);
+      if (pending) { this.pending.delete(message.requestId); pending.resolve(message); }
+      else this.pushEvent(message);
+    });
+    socket.addEventListener("close", () => {
+      for (const waiter of this.pending.values()) waiter.reject(new Error("任务连接已关闭"));
+      this.pending.clear();
+    });
+    const hello = await this.request("HELLO", { protocol: PROTOCOL_NAME, clientName: "sft-batch-task" });
+    if (hello.type !== "HELLO_ACK") throw new Error("任务协议协商失败");
+    const auth = await this.request("AUTH_TOKEN", { token: this.token });
+    if (auth.type !== "AUTH_SUCCESS") throw new Error("任务会话认证失败");
+  }
+
+  request(type: Parameters<typeof createControlMessage>[0], payload: Record<string, unknown>): Promise<ReturnType<typeof parseControlMessage>> {
+    const requestId = crypto.randomUUID();
+    return new Promise((resolvePromise, reject) => {
+      this.pending.set(requestId, { resolve: resolvePromise, reject });
+      this.send(type, payload, requestId);
+    });
+  }
+
+  requestBinary(requestId: string, frame: Uint8Array): Promise<ReturnType<typeof parseControlMessage>> {
+    return new Promise((resolvePromise, reject) => {
+      this.pending.set(requestId, { resolve: resolvePromise, reject });
+      this.socket?.send(frame);
+    });
+  }
+
+  send(type: Parameters<typeof createControlMessage>[0], payload: Record<string, unknown>, requestId: string = crypto.randomUUID()): void {
+    if (this.socket?.readyState !== WebSocket.OPEN) throw new Error("任务连接未打开");
+    this.socket.send(serializeControlMessage(createControlMessage(type, requestId, payload)));
+  }
+
+  async nextEvent(): Promise<ArrayBuffer | ReturnType<typeof parseControlMessage>> {
+    const event = this.events.shift();
+    if (event) return event;
+    return new Promise((resolvePromise) => this.eventWaiters.push(resolvePromise));
+  }
+
+  close(): void { this.socket?.close(1000, "task finished"); }
+  private pushEvent(value: ArrayBuffer | ReturnType<typeof parseControlMessage>): void {
+    const waiter = this.eventWaiters.shift();
+    if (waiter) waiter(value); else this.events.push(value);
+  }
+}
+
+class BatchUploadWorker {
+  private protocol?: TaskProtocolSocket;
+  private transferId?: string;
+  constructor(
+    private readonly view: TransferTaskView, private readonly file: File, private readonly path: string,
+    private readonly token: string, private readonly url: string,
+  ) {}
+
+  async run(): Promise<void> {
+    const started = performance.now();
+    try {
+      if (this.view.cancelled) return;
+      this.view.status = "hashing";
+      const hasher = sha256.create();
+      for (let offset = 0; offset < this.file.size; offset += 1024 * 1024) {
+        if (this.view.cancelled) return;
+        hasher.update(new Uint8Array(await this.file.slice(offset, Math.min(this.file.size, offset + 1024 * 1024)).arrayBuffer()));
+      }
+      this.protocol = new TaskProtocolSocket(this.url, this.token);
+      await this.protocol.connect();
+      const logicalPath = this.path ? `${this.path}/${this.file.name}` : this.file.name;
+      const ready = await this.protocol.request("UPLOAD_INIT", {
+        path: logicalPath, fileSize: this.file.size, fileSha256: nobleBytesToHex(hasher.digest()),
+      });
+      if (ready.type !== "UPLOAD_READY") throw protocolTaskError(ready);
+      const payload = asRecord(ready.payload);
+      this.transferId = readString(payload, "transferId");
+      const chunkSize = readNumber(payload, "chunkSize");
+      this.view.status = "uploading";
+      for (let offset = 0; offset < this.file.size; offset += chunkSize) {
+        if (this.view.cancelled) { await this.cancel(); return; }
+        const chunk = new Uint8Array(await this.file.slice(offset, Math.min(this.file.size, offset + chunkSize)).arrayBuffer());
+        const requestId = crypto.randomUUID();
+        const frame = encodeBinaryFrame({
+          messageType: BINARY_MESSAGE_TYPES.uploadChunk, flags: BINARY_FLAGS.ackRequired, errorCode: 0,
+          requestId, transferId: this.transferId, fileSize: BigInt(this.file.size), offset: BigInt(offset), payloadSha256: sha256(chunk),
+        }, chunk);
+        const ack = await this.protocol.requestBinary(requestId, frame);
+        if (ack.type !== "UPLOAD_ACK") throw protocolTaskError(ack);
+        const persisted = readNumber(asRecord(ack.payload), "persistedOffset");
+        updateTaskView(this.view, persisted, this.file.size, started);
+      }
+      const complete = await this.protocol.request("UPLOAD_FINISH", { transferId: this.transferId });
+      if (complete.type !== "UPLOAD_COMPLETE") throw protocolTaskError(complete);
+      this.view.status = "completed"; this.view.progress = 100; this.view.message = "上传完成";
+    } catch (error) {
+      if (!this.view.cancelled) { this.view.status = "error"; this.view.message = error instanceof Error ? error.message : "上传失败"; }
+    } finally { this.protocol?.close(); }
+  }
+
+  async cancel(): Promise<void> {
+    this.view.cancelled = true; this.view.status = "cancelled"; this.view.message = "已取消";
+    if (this.protocol && this.transferId) await this.protocol.request("UPLOAD_ABORT", { transferId: this.transferId }).catch(() => undefined);
+    this.protocol?.close();
+  }
+}
+
+class BatchDownloadWorker {
+  private protocol?: TaskProtocolSocket;
+  private transferId?: string;
+  constructor(
+    private readonly view: TransferTaskView, private readonly path: string, private readonly listedSize: number,
+    private readonly target: BatchDownloadTarget, private readonly token: string, private readonly url: string,
+  ) {}
+
+  async run(): Promise<void> {
+    const started = performance.now();
+    try {
+      this.protocol = new TaskProtocolSocket(this.url, this.token);
+      await this.protocol.connect();
+      const ready = await this.protocol.request("DOWNLOAD_INIT", { path: this.path });
+      if (ready.type !== "DOWNLOAD_READY") throw protocolTaskError(ready);
+      const metadata = asRecord(ready.payload);
+      this.transferId = readString(metadata, "transferId");
+      const fileSize = readNumber(metadata, "fileSize");
+      const expectedHash = readString(metadata, "fileSha256");
+      if (!this.target.writable && fileSize > FALLBACK_DOWNLOAD_LIMIT) throw new Error("兼容模式下载超过 32 MiB");
+      this.view.status = "downloading";
+      const hasher = sha256.create();
+      let offset = 0;
+      while (offset < fileSize) {
+        if (this.view.cancelled) { await this.cancel(); return; }
+        const event = await this.protocol.nextEvent();
+        if (!(event instanceof ArrayBuffer)) throw protocolTaskError(event);
+        const frame = parseBinaryFrame(event, 1024 * 1024);
+        if (frame.header.messageType !== BINARY_MESSAGE_TYPES.downloadChunk
+          || frame.header.transferId !== this.transferId || frame.header.offset !== BigInt(offset)
+          || !equalBytes(sha256(frame.payload), frame.header.payloadSha256)) throw new Error("下载分块校验失败");
+        if (this.target.writable) await this.target.writable.write(new Uint8Array(frame.payload).buffer as ArrayBuffer);
+        else this.target.chunks.push(new Uint8Array(frame.payload).buffer as ArrayBuffer);
+        hasher.update(frame.payload); offset += frame.payload.byteLength;
+        updateTaskView(this.view, offset, fileSize, started);
+        this.protocol.send("DOWNLOAD_ACK", { transferId: this.transferId, nextOffset: offset });
+      }
+      const finish = await this.protocol.nextEvent();
+      if (finish instanceof ArrayBuffer || finish.type !== "DOWNLOAD_FINISH") throw new Error("缺少下载完成消息");
+      const digest = nobleBytesToHex(hasher.digest());
+      if (digest !== expectedHash || offset !== fileSize) throw new Error("整文件 SHA-256 校验失败");
+      if (this.target.writable) { await this.target.writable.close(); delete this.target.writable; }
+      const complete = await this.protocol.request("DOWNLOAD_COMPLETE", {
+        transferId: this.transferId, success: true, receivedSize: offset, fileSha256: digest,
+      });
+      if (complete.type !== "DOWNLOAD_COMPLETE") throw protocolTaskError(complete);
+      this.view.status = "saving"; this.view.message = "校验通过，正在保存";
+      await deliverBatchTarget(this.target, this.view.name);
+      this.view.status = "completed"; this.view.progress = 100; this.view.message = `下载完成 · ${formatBytes(this.listedSize)}`;
+    } catch (error) {
+      if (!this.view.cancelled) { this.view.status = "error"; this.view.message = error instanceof Error ? error.message : "下载失败"; }
+    } finally { await cleanupBatchTarget(this.target); this.protocol?.close(); }
+  }
+
+  async cancel(): Promise<void> {
+    this.view.cancelled = true; this.view.status = "cancelled"; this.view.message = "已取消";
+    if (this.protocol && this.transferId) await this.protocol.request("DOWNLOAD_ABORT", { transferId: this.transferId }).catch(() => undefined);
+    await cleanupBatchTarget(this.target); this.protocol?.close();
+  }
+}
+
+async function deliverBatchTarget(target: BatchDownloadTarget, fileName: string): Promise<void> {
+  if (target.finalHandle && target.temporaryHandle) {
+    const source = await target.temporaryHandle.getFile();
+    const destination = await target.finalHandle.createWritable();
+    await source.stream().pipeTo(destination);
+  } else {
+    const url = URL.createObjectURL(new Blob(target.chunks, { type: "application/octet-stream" }));
+    const anchor = document.createElement("a"); anchor.href = url; anchor.download = fileName; anchor.click();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1_000);
+  }
+}
+
+async function cleanupBatchTarget(target: BatchDownloadTarget): Promise<void> {
+  if (target.writable) await target.writable.abort().catch(() => undefined);
+  if (target.root && target.temporaryName) await target.root.removeEntry(target.temporaryName).catch(() => undefined);
+  target.chunks = [];
+}
+
+function updateTaskView(view: TransferTaskView, bytes: number, total: number, started: number): void {
+  view.progress = total === 0 ? 100 : Math.round(bytes / total * 100);
+  view.speed = bytes / Math.max((performance.now() - started) / 1000, 0.001);
+  view.message = `${formatBytes(bytes)} / ${formatBytes(total)}`;
+}
+
+function protocolTaskError(message: ReturnType<typeof parseControlMessage>): Error {
+  const payload = asRecord(message.payload);
+  return new Error(`${typeof payload.code === "string" ? `${payload.code}：` : ""}${typeof payload.message === "string" ? payload.message : message.type}`);
+}
+
 async function startUpload(): Promise<void> {
   const file = selectedFile.value;
   if (!file || authStatus.value !== "authenticated" || connectionStatus.value !== "connected") return;
@@ -646,6 +980,7 @@ function login(): void {
 
 function logout(): void {
   if (authStatus.value === "authenticated") {
+    for (const controller of taskControllers.values()) void controller.cancel();
     if (["hashing", "initializing", "uploading", "verifying"].includes(uploadStatus.value)) cancelUpload();
     if (isDownloadActive()) cancelDownload();
     send("AUTH_LOGOUT", {});
@@ -709,6 +1044,8 @@ function handleServerError(value: unknown): void {
 }
 
 function clearAuthentication(): void {
+  for (const controller of taskControllers.values()) void controller.cancel();
+  taskControllers.clear();
   resetUploadState();
   resetDownloadState();
   void cleanupDownloadTarget();
@@ -860,49 +1197,29 @@ onBeforeUnmount(disconnect);
         <section class="upload-panel">
           <div class="upload-picker">
             <label class="file-picker-label">
-              <span>{{ selectedFile ? '重新选择文件' : '选择本地文件' }}</span>
-              <input type="file" :disabled="['hashing', 'initializing', 'uploading', 'verifying', 'cancelling'].includes(uploadStatus)" @change="selectFile" />
+              <span>{{ batchSelectedFiles.length ? '重新选择文件' : '批量选择文件' }}</span>
+              <input type="file" multiple @change="selectBatchFiles" />
             </label>
             <div class="selected-file-copy">
-              <strong>{{ selectedFile?.name ?? '尚未选择文件' }}</strong>
-              <span>{{ selectedFile ? formatBytes(selectedFile.size) : '文件将上传到当前私人目录' }}</span>
+              <strong>{{ batchSelectedFiles.length ? `已选择 ${batchSelectedFiles.length} 个文件` : '尚未选择文件' }}</strong>
+              <span>最多 3 个任务并行，文件上传到当前私人目录</span>
             </div>
             <el-button
               type="primary"
-              :disabled="!selectedFile || connectionStatus !== 'connected' || authStatus !== 'authenticated' || isDownloadActive() || ['hashing', 'initializing', 'uploading', 'verifying', 'cancelling'].includes(uploadStatus)"
-              @click="startUpload"
-            >上传</el-button>
-            <el-button
-              v-if="['hashing', 'initializing', 'uploading', 'verifying'].includes(uploadStatus)"
-              type="danger"
-              plain
-              @click="cancelUpload"
-            >取消</el-button>
-          </div>
-          <div v-if="uploadStatus !== 'idle'" class="upload-progress-row">
-            <el-progress :percentage="uploadProgress" :status="uploadStatus === 'error' ? 'exception' : uploadStatus === 'completed' ? 'success' : undefined" />
-            <div class="upload-meta">
-              <span>{{ uploadMessage }}</span>
-              <span v-if="uploadSpeed > 0">{{ formatBytes(uploadSpeed) }}/s</span>
-              <el-tag size="small">{{ uploadStatus }}</el-tag>
-            </div>
+              :disabled="!batchSelectedFiles.length || connectionStatus !== 'connected' || authStatus !== 'authenticated'"
+              @click="startBatchUploads"
+            >开始批量上传</el-button>
           </div>
         </section>
-        <section v-if="downloadStatus !== 'idle'" class="download-panel">
-          <div class="card-header">
-            <div class="selected-file-copy">
-              <strong>{{ downloadFileName || '下载任务' }}</strong>
-              <span>{{ downloadMessage }}</span>
+        <section v-if="transferTasks.length" class="download-panel">
+          <div class="card-header"><strong>传输任务</strong><el-button text @click="clearFinishedTasks">清理已结束</el-button></div>
+          <div v-for="task in transferTasks" :key="task.id" class="task-row">
+            <div class="task-title"><span>{{ task.direction === 'upload' ? '↑' : '↓' }} {{ task.name }}</span><el-tag size="small">{{ task.status }}</el-tag></div>
+            <el-progress :percentage="task.progress" :status="task.status === 'error' ? 'exception' : task.status === 'completed' ? 'success' : undefined" />
+            <div class="download-meta">
+              <span>{{ task.message }}</span><span v-if="task.speed > 0">{{ formatBytes(task.speed) }}/s</span>
+              <el-button v-if="!['completed', 'cancelled', 'error'].includes(task.status)" text type="danger" @click="cancelTransferTask(task)">取消</el-button>
             </div>
-            <el-button v-if="isDownloadCancelable()" type="danger" plain @click="cancelDownload">取消下载</el-button>
-          </div>
-          <el-progress
-            :percentage="downloadProgress"
-            :status="downloadStatus === 'error' ? 'exception' : downloadStatus === 'completed' ? 'success' : undefined"
-          />
-          <div class="download-meta">
-            <span v-if="downloadSpeed > 0">{{ formatBytes(downloadSpeed) }}/s</span>
-            <el-tag size="small">{{ downloadStatus }}</el-tag>
           </div>
         </section>
         <el-table :data="fileEntries" empty-text="私人目录为空；可在上方选择文件上传" @row-dblclick="openDirectory">
@@ -918,8 +1235,8 @@ onBeforeUnmount(disconnect);
                 v-if="scope.row.type === 'file'"
                 type="primary"
                 text
-                :disabled="isDownloadActive() || ['hashing', 'initializing', 'uploading', 'verifying', 'cancelling'].includes(uploadStatus)"
-                @click="startDownload(scope.row)"
+                :disabled="downloadTaskViews.filter(task => !['completed', 'cancelled', 'error'].includes(task.status)).length >= 3"
+                @click="startBatchDownload(scope.row)"
               >下载</el-button>
             </template>
           </el-table-column>

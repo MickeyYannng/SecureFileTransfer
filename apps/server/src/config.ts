@@ -21,6 +21,13 @@ export interface RuntimeConfig {
   downloadAckTimeoutMs: number;
   maxActiveDownloadsGlobal: number;
   maxActiveDownloadsPerUser: number;
+  tlsCertPath: string | undefined;
+  tlsKeyPath: string | undefined;
+  requireTls: boolean;
+  allowedOrigins: string[];
+  maxConnections: number;
+  loginMaxAttempts: number;
+  loginWindowMs: number;
 }
 
 export function loadRuntimeConfig(environment: NodeJS.ProcessEnv = process.env): RuntimeConfig {
@@ -37,12 +44,23 @@ export function loadRuntimeConfig(environment: NodeJS.ProcessEnv = process.env):
     defaultMaxFiles: positiveInteger(environment.SFT_DEFAULT_MAX_FILES, 1_000),
     uploadChunkSize: positiveInteger(environment.SFT_UPLOAD_CHUNK_SIZE, 256 * 1024),
     maxActiveUploadsGlobal: positiveInteger(environment.SFT_MAX_ACTIVE_UPLOADS_GLOBAL, 32),
-    maxActiveUploadsPerUser: positiveInteger(environment.SFT_MAX_ACTIVE_UPLOADS_PER_USER, 1),
+    maxActiveUploadsPerUser: positiveInteger(environment.SFT_MAX_ACTIVE_UPLOADS_PER_USER, 3),
     downloadChunkSize: positiveInteger(environment.SFT_DOWNLOAD_CHUNK_SIZE, 256 * 1024),
     downloadAckTimeoutMs: positiveInteger(environment.SFT_DOWNLOAD_ACK_TIMEOUT_MS, 15_000),
     maxActiveDownloadsGlobal: positiveInteger(environment.SFT_MAX_ACTIVE_DOWNLOADS_GLOBAL, 32),
-    maxActiveDownloadsPerUser: positiveInteger(environment.SFT_MAX_ACTIVE_DOWNLOADS_PER_USER, 1),
+    maxActiveDownloadsPerUser: positiveInteger(environment.SFT_MAX_ACTIVE_DOWNLOADS_PER_USER, 3),
+    tlsCertPath: optionalPath(environment.SFT_TLS_CERT_PATH),
+    tlsKeyPath: optionalPath(environment.SFT_TLS_KEY_PATH),
+    requireTls: environment.SFT_REQUIRE_TLS === "true",
+    allowedOrigins: (environment.SFT_ALLOWED_ORIGINS ?? "").split(",").map((value) => value.trim()).filter(Boolean),
+    maxConnections: positiveInteger(environment.SFT_MAX_CONNECTIONS, 100),
+    loginMaxAttempts: positiveInteger(environment.SFT_LOGIN_MAX_ATTEMPTS, 5),
+    loginWindowMs: positiveInteger(environment.SFT_LOGIN_WINDOW_MS, 60_000),
   };
+}
+
+function optionalPath(value: string | undefined): string | undefined {
+  return value ? resolve(projectRoot, value) : undefined;
 }
 
 function positiveInteger(value: string | undefined, fallback: number): number {

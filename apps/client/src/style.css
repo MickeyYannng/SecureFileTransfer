@@ -51,6 +51,9 @@ h2 { margin: 12px 0; font-size: clamp(28px, 4vw, 44px); line-height: 1.1; letter
 .upload-progress-row { margin-top: 16px; }
 .upload-meta { display: flex; align-items: center; gap: 14px; margin-top: 8px; }
 .download-meta { display: flex; align-items: center; justify-content: flex-end; gap: 14px; margin-top: 8px; color: #58706a; font-size: 12px; }
+.task-row { padding: 12px 0; border-top: 1px solid #dbece6; }
+.task-row:first-of-type { margin-top: 10px; }
+.task-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 7px; font-weight: 700; }
 
 .connection-facts { display: flex; flex-wrap: wrap; gap: 10px 24px; color: #5f6d80; font-size: 13px; }
 details { margin-top: 16px; }
