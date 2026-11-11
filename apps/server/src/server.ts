@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import express from "express";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import {
+  BINARY_HEADER_LENGTH,
   ERROR_CODES,
   MAX_CONTROL_MESSAGE_BYTES,
   PROTOCOL_NAME,
@@ -11,6 +12,7 @@ import {
   createControlMessage,
   hasStringField,
   parseControlMessage,
+  parseBinaryFrame,
   serializeControlMessage,
   type AuthMeResultPayload,
   type AuthSuccessPayload,
@@ -18,16 +20,20 @@ import {
   type ErrorPayload,
   type HeartbeatPayload,
   type HelloAckPayload,
+  type UploadErrorPayload,
 } from "@sft/protocol";
 import { AuthFailure, AuthService, type AuthenticatedSession } from "./auth.js";
 import { AppDatabase } from "./database.js";
 import { StorageFailure, StorageService } from "./storage.js";
+import { UploadFailure, UploadManager } from "./upload.js";
 
 export interface InitialUser {
   id?: string;
   username: string;
   password: string;
   displayName: string;
+  quotaBytes?: number;
+  maxFiles?: number;
 }
 
 export interface ServerOptions {
@@ -41,6 +47,9 @@ export interface ServerOptions {
   maxFileSizeBytes?: number;
   defaultQuotaBytes?: number;
   defaultMaxFiles?: number;
+  uploadChunkSize?: number;
+  maxActiveUploadsGlobal?: number;
+  maxActiveUploadsPerUser?: number;
   initialUsers?: InitialUser[];
   logger?: Pick<Console, "info" | "warn" | "error">;
 }
@@ -54,6 +63,7 @@ interface ConnectionState {
   messagesInWindow: number;
   rateWindowStartedAt: number;
   messageChain: Promise<void>;
+  pendingMessages: number;
 }
 
 export interface RunningServer {
@@ -65,6 +75,7 @@ export interface RunningServer {
 
 const CONTROL_RATE_WINDOW_MS = 10_000;
 const CONTROL_RATE_LIMIT = 100;
+const MAX_PENDING_MESSAGES = 8;
 const defaultDatabasePath = fileURLToPath(new URL("../../../data/sft.sqlite", import.meta.url));
 const defaultStorageRoot = fileURLToPath(new URL("../../../storage", import.meta.url));
 
@@ -77,12 +88,18 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
   const maxFileSizeBytes = options.maxFileSizeBytes ?? 512 * 1024 * 1024;
   const defaultQuotaBytes = options.defaultQuotaBytes ?? 1024 * 1024 * 1024;
   const defaultMaxFiles = options.defaultMaxFiles ?? 1_000;
+  const uploadChunkSize = options.uploadChunkSize ?? 256 * 1024;
+  const maxActiveUploadsGlobal = options.maxActiveUploadsGlobal ?? 32;
+  const maxActiveUploadsPerUser = options.maxActiveUploadsPerUser ?? 1;
   const logger = options.logger ?? console;
 
   if (heartbeatIntervalMs <= 0 || heartbeatTimeoutMs <= heartbeatIntervalMs) {
     throw new Error("heartbeat timeout must be greater than the positive interval");
   }
   if (sessionTtlMs <= 0) throw new Error("session TTL must be positive");
+  if (uploadChunkSize < 16 * 1024 || uploadChunkSize > 1024 * 1024) {
+    throw new Error("upload chunk size must be between 16 KiB and 1 MiB");
+  }
 
   const database = new AppDatabase(options.databasePath ?? defaultDatabasePath);
   const auth = await AuthService.create(database, { sessionTtlMs, defaultQuotaBytes, defaultMaxFiles });
@@ -92,6 +109,11 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
     defaultMaxFiles,
   });
   await storage.initialize();
+  const upload = new UploadManager(storage, {
+    chunkSize: uploadChunkSize,
+    maxActiveUploadsGlobal,
+    maxActiveUploadsPerUser,
+  });
   for (const initialUser of options.initialUsers ?? []) {
     const result = await auth.createUser(initialUser);
     await storage.ensureUserRoot(result.user.id);
@@ -100,14 +122,14 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
   const app = express();
   app.disable("x-powered-by");
   app.get("/health", (_request, response) => {
-    response.json({ status: "ok", protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, phase: "2.1" });
+    response.json({ status: "ok", protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, phase: "2.2" });
   });
 
   const httpServer = createServer(app);
   const webSocketServer = new WebSocketServer({
     server: httpServer,
     path: "/ws",
-    maxPayload: MAX_CONTROL_MESSAGE_BYTES,
+    maxPayload: Math.max(MAX_CONTROL_MESSAGE_BYTES, BINARY_HEADER_LENGTH + uploadChunkSize),
     perMessageDeflate: false,
   });
   webSocketServer.on("error", () => logger.error("WebSocket server transport error"));
@@ -122,10 +144,18 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
       messagesInWindow: 0,
       rateWindowStartedAt: now,
       messageChain: Promise.resolve(),
+      pendingMessages: 0,
     };
     states.set(socket, state);
 
     socket.on("message", (data, isBinary) => {
+      state.pendingMessages += 1;
+      if (state.pendingMessages > MAX_PENDING_MESSAGES) {
+        sendError(socket, randomUUID(), ERROR_CODES.rateLimited, "too many queued messages", true);
+        socket.close(1008, "message queue limit exceeded");
+        state.pendingMessages -= 1;
+        return;
+      }
       state.messageChain = state.messageChain
         .then(() => handleIncomingMessage(
           socket,
@@ -134,16 +164,20 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
           isBinary,
           auth,
           storage,
+          upload,
           logger,
           heartbeatIntervalMs,
           heartbeatTimeoutMs,
+          uploadChunkSize,
         ))
         .catch(() => {
           logger.error(`Unhandled request failure on connection ${state.connectionId}`);
           sendError(socket, randomUUID(), ERROR_CODES.internalError, "internal server error", false);
-        });
+        })
+        .finally(() => { state.pendingMessages -= 1; });
     });
     socket.on("error", (error) => logger.warn(`WebSocket ${state.connectionId}: ${error.message}`));
+    socket.on("close", () => { void upload.abortByConnection(state.connectionId); });
   });
 
   const heartbeatTimer = setInterval(() => {
@@ -182,7 +216,7 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
 
   const address = httpServer.address();
   if (!address || typeof address === "string") throw new Error("server did not bind to a TCP port");
-  logger.info(`SFT Phase 2.1 server listening on http://${host}:${address.port}`);
+  logger.info(`SFT Phase 2.2 server listening on http://${host}:${address.port}`);
 
   return {
     host,
@@ -190,7 +224,11 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
     httpServer,
     async close() {
       clearInterval(heartbeatTimer);
-      for (const socket of webSocketServer.clients) socket.terminate();
+      for (const socket of webSocketServer.clients) {
+        const state = states.get(socket);
+        if (state) await upload.abortByConnection(state.connectionId);
+        socket.terminate();
+      }
       await new Promise<void>((resolve) => webSocketServer.close(() => resolve()));
       await new Promise<void>((resolve, reject) => {
         httpServer.close((error) => (error ? reject(error) : resolve()));
@@ -207,20 +245,21 @@ async function handleIncomingMessage(
   isBinary: boolean,
   auth: AuthService,
   storage: StorageService,
+  upload: UploadManager,
   logger: Pick<Console, "info" | "warn" | "error">,
   heartbeatIntervalMs: number,
   heartbeatTimeoutMs: number,
+  uploadChunkSize: number,
 ): Promise<void> {
+  if (isBinary) {
+    await handleUploadChunk(socket, state, data, auth, upload, uploadChunkSize);
+    return;
+  }
   if (!allowControlMessage(state)) {
     sendError(socket, randomUUID(), ERROR_CODES.rateLimited, "too many control messages", true);
     socket.close(1008, "rate limit exceeded");
     return;
   }
-  if (isBinary) {
-    sendError(socket, randomUUID(), ERROR_CODES.notImplemented, "binary transfer frames begin in Phase 2.2", false);
-    return;
-  }
-
   let message: ControlMessage<unknown>;
   try {
     message = parseControlMessage(rawDataToUtf8(data));
@@ -299,6 +338,7 @@ async function handleIncomingMessage(
       }
       case "AUTH_LOGOUT": {
         const session = requireCurrentSession(state, auth);
+        await upload.abortByConnection(state.connectionId);
         auth.logout(session.sessionId);
         delete state.sessionId;
         send(socket, createControlMessage("AUTH_LOGOUT_ACK", message.requestId, {}));
@@ -311,22 +351,65 @@ async function handleIncomingMessage(
         send(socket, createControlMessage("FILE_LIST_RESULT", message.requestId, result));
         return;
       }
+      case "UPLOAD_INIT": {
+        const session = requireCurrentSession(state, auth);
+        const logicalPath = requiredString(message.payload, "path", 1024);
+        const fileSize = requiredNonNegativeInteger(message.payload, "fileSize");
+        const fileSha256 = requiredString(message.payload, "fileSha256", 64);
+        const ready = await upload.initialize(state.connectionId, session.user, logicalPath, fileSize, fileSha256);
+        send(socket, createControlMessage("UPLOAD_READY", message.requestId, ready));
+        return;
+      }
+      case "UPLOAD_FINISH": {
+        const session = requireCurrentSession(state, auth);
+        const transferId = requiredString(message.payload, "transferId", 36);
+        const complete = await upload.finish(state.connectionId, session.user, transferId);
+        send(socket, createControlMessage("UPLOAD_COMPLETE", message.requestId, complete));
+        return;
+      }
+      case "UPLOAD_ABORT": {
+        const session = requireCurrentSession(state, auth);
+        const transferId = requiredString(message.payload, "transferId", 36);
+        await upload.abort(state.connectionId, session.user.id, transferId);
+        send(socket, createControlMessage("UPLOAD_ABORTED", message.requestId, { transferId }));
+        return;
+      }
       case "HELLO_ACK":
       case "AUTH_SUCCESS":
       case "AUTH_LOGOUT_ACK":
       case "AUTH_ME_RESULT":
       case "FILE_LIST_RESULT":
+      case "UPLOAD_READY":
+      case "UPLOAD_ACK":
+      case "UPLOAD_COMPLETE":
+      case "UPLOAD_ABORTED":
+      case "UPLOAD_ERROR":
       case "ERROR":
         throw new ProtocolFailure(`${message.type} is server-originated`);
     }
   } catch (error) {
     if (error instanceof AuthFailure) {
-      if (error.code === "SESSION_EXPIRED" || error.code === "SESSION_REVOKED") delete state.sessionId;
-      sendError(socket, message.requestId, authErrorCode(error.code), error.message, false);
+      if (error.code === "SESSION_EXPIRED" || error.code === "SESSION_REVOKED") {
+        delete state.sessionId;
+        await upload.abortByConnection(state.connectionId);
+      }
+      if (isUploadControlType(message.type)) {
+        sendUploadError(socket, message.requestId, authErrorCode(error.code), error.message, false, upload.getTransferIdForConnection(state.connectionId));
+      } else {
+        sendError(socket, message.requestId, authErrorCode(error.code), error.message, false);
+      }
+      return;
+    }
+    if (error instanceof UploadFailure) {
+      sendUploadError(socket, message.requestId, uploadErrorCode(error.code), error.message, false, error.transferId);
       return;
     }
     if (error instanceof StorageFailure) {
-      sendError(socket, message.requestId, storageErrorCode(error.code), error.message, false);
+      if (isUploadControlType(message.type)) {
+        sendUploadError(socket, message.requestId, storageErrorCode(error.code), error.message, false, upload.getTransferIdForConnection(state.connectionId));
+      } else {
+        sendError(socket, message.requestId, storageErrorCode(error.code), error.message, false);
+      }
       return;
     }
     if (error instanceof ProtocolFailure) {
@@ -335,6 +418,39 @@ async function handleIncomingMessage(
     }
     logger.error(`Request ${message.type} failed on connection ${state.connectionId}`);
     sendError(socket, message.requestId, ERROR_CODES.internalError, "internal server error", false);
+  }
+}
+
+async function handleUploadChunk(
+  socket: WebSocket,
+  state: ConnectionState,
+  data: RawData,
+  auth: AuthService,
+  upload: UploadManager,
+  uploadChunkSize: number,
+): Promise<void> {
+  let requestId: string = randomUUID();
+  let transferId: string | undefined;
+  try {
+    const session = requireCurrentSession(state, auth);
+    const frame = parseBinaryFrame(rawDataToBytes(data), uploadChunkSize);
+    requestId = frame.header.requestId;
+    transferId = frame.header.transferId;
+    const ack = await upload.acceptChunk(state.connectionId, session.user, frame);
+    send(socket, createControlMessage("UPLOAD_ACK", requestId, ack));
+  } catch (error) {
+    if (error instanceof AuthFailure) {
+      if (error.code === "SESSION_EXPIRED" || error.code === "SESSION_REVOKED") delete state.sessionId;
+      await upload.abortByConnection(state.connectionId);
+      sendUploadError(socket, requestId, authErrorCode(error.code), error.message, false, transferId);
+      return;
+    }
+    if (error instanceof UploadFailure) {
+      sendUploadError(socket, requestId, uploadErrorCode(error.code), error.message, false, error.transferId ?? transferId);
+      return;
+    }
+    await upload.abortByConnection(state.connectionId);
+    sendUploadError(socket, requestId, ERROR_CODES.invalidChunk, "invalid binary upload frame", false, transferId);
   }
 }
 
@@ -356,6 +472,17 @@ function requiredStringAllowEmpty(value: unknown, field: string, maxLength: numb
   const candidate = readStringField(value, field);
   if (candidate.length > maxLength) {
     throw new ProtocolFailure(`${field} must be a string`);
+  }
+  return candidate;
+}
+
+function requiredNonNegativeInteger(value: unknown, field: string): number {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new ProtocolFailure(`${field} must be a non-negative integer`);
+  }
+  const candidate = (value as Record<string, unknown>)[field];
+  if (typeof candidate !== "number" || !Number.isSafeInteger(candidate) || candidate < 0) {
+    throw new ProtocolFailure(`${field} must be a non-negative integer`);
   }
   return candidate;
 }
@@ -383,7 +510,29 @@ function storageErrorCode(code: StorageFailure["code"]): string {
     case "INVALID_PATH": return ERROR_CODES.invalidPath;
     case "NOT_FOUND": return ERROR_CODES.notFound;
     case "FORBIDDEN": return ERROR_CODES.forbidden;
+    case "FILE_EXISTS": return ERROR_CODES.fileExists;
   }
+}
+
+function uploadErrorCode(code: UploadFailure["code"]): string {
+  switch (code) {
+    case "INVALID_INIT": return ERROR_CODES.invalidPayload;
+    case "INVALID_CHUNK": return ERROR_CODES.invalidChunk;
+    case "INVALID_OFFSET": return ERROR_CODES.invalidOffset;
+    case "SIZE_MISMATCH": return ERROR_CODES.sizeMismatch;
+    case "HASH_MISMATCH": return ERROR_CODES.hashMismatch;
+    case "FILE_EXISTS": return ERROR_CODES.fileExists;
+    case "QUOTA_EXCEEDED": return ERROR_CODES.quotaExceeded;
+    case "TOO_MANY_TASKS": return ERROR_CODES.tooManyTasks;
+    case "INSUFFICIENT_STORAGE": return ERROR_CODES.insufficientStorage;
+    case "UPLOAD_NOT_FOUND": return ERROR_CODES.notFound;
+    case "UPLOAD_CANCELLED": return ERROR_CODES.uploadCancelled;
+    case "IO_ERROR": return ERROR_CODES.internalError;
+  }
+}
+
+function isUploadControlType(type: ControlMessage<unknown>["type"]): boolean {
+  return type === "UPLOAD_INIT" || type === "UPLOAD_FINISH" || type === "UPLOAD_ABORT";
 }
 
 function send(socket: WebSocket, message: ControlMessage<unknown>): void {
@@ -401,6 +550,20 @@ function sendError(
   send(socket, createControlMessage("ERROR", requestId, payload));
 }
 
+function sendUploadError(
+  socket: WebSocket,
+  requestId: string,
+  code: string,
+  message: string,
+  retryable: boolean,
+  transferId?: string,
+): void {
+  const payload: UploadErrorPayload = transferId
+    ? { code, message, retryable, transferId }
+    : { code, message, retryable };
+  send(socket, createControlMessage("UPLOAD_ERROR", requestId, payload));
+}
+
 function allowControlMessage(state: ConnectionState): boolean {
   const now = Date.now();
   if (now - state.rateWindowStartedAt >= CONTROL_RATE_WINDOW_MS) {
@@ -415,4 +578,10 @@ function rawDataToUtf8(data: RawData): string {
   if (Array.isArray(data)) return Buffer.concat(data).toString("utf8");
   if (data instanceof ArrayBuffer) return Buffer.from(data).toString("utf8");
   return data.toString("utf8");
+}
+
+function rawDataToBytes(data: RawData): Uint8Array {
+  if (Array.isArray(data)) return Buffer.concat(data);
+  if (data instanceof ArrayBuffer) return new Uint8Array(data);
+  return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
 }

@@ -1,5 +1,5 @@
-import { lstat, mkdir, readdir, realpath, stat } from "node:fs/promises";
-import { isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
+import { link, lstat, mkdir, open, readdir, realpath, rm, stat, statfs, unlink } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve, sep, win32 } from "node:path";
 import type { FileListEntry, FileListResultPayload, PublicUser, StorageUsage } from "@sft/protocol";
 
 export interface StorageLimits {
@@ -10,7 +10,7 @@ export interface StorageLimits {
 
 export class StorageFailure extends Error {
   constructor(
-    readonly code: "INVALID_PATH" | "NOT_FOUND" | "FORBIDDEN",
+    readonly code: "INVALID_PATH" | "NOT_FOUND" | "FORBIDDEN" | "FILE_EXISTS",
     message: string,
   ) {
     super(message);
@@ -21,16 +21,22 @@ export class StorageFailure extends Error {
 export class StorageService {
   readonly root: string;
   private readonly usersRoot: string;
+  private readonly temporaryRoot: string;
 
   constructor(storageRoot: string, readonly limits: StorageLimits) {
     this.root = resolve(storageRoot);
     this.usersRoot = join(this.root, "users");
+    this.temporaryRoot = join(this.root, ".upload-tmp");
   }
 
   async initialize(): Promise<void> {
     await mkdir(this.usersRoot, { recursive: true });
     await this.assertDirectoryIsNotLink(this.root);
     await this.assertDirectoryIsNotLink(this.usersRoot);
+    assertContained(this.root, this.temporaryRoot);
+    await rm(this.temporaryRoot, { recursive: true, force: true });
+    await mkdir(this.temporaryRoot, { recursive: true });
+    await this.assertDirectoryIsNotLink(this.temporaryRoot);
   }
 
   async ensureUserRoot(userId: string): Promise<string> {
@@ -82,6 +88,59 @@ export class StorageService {
       if (!isNotFound(error)) throw error;
     }
     return target;
+  }
+
+  async prepareUploadPaths(userId: string, logicalPath: string, transferId: string): Promise<{
+    finalPath: string;
+    temporaryPath: string;
+  }> {
+    const finalPath = await this.resolveForCreate(userId, logicalPath);
+    try {
+      await lstat(finalPath);
+      throw new StorageFailure("FILE_EXISTS", "destination already exists");
+    } catch (error) {
+      if (!(error instanceof StorageFailure) && !isNotFound(error)) throw error;
+      if (error instanceof StorageFailure) throw error;
+    }
+    const userTemporaryRoot = join(this.temporaryRoot, userId);
+    assertContained(this.temporaryRoot, userTemporaryRoot);
+    await mkdir(userTemporaryRoot, { recursive: true });
+    await this.assertDirectoryIsNotLink(userTemporaryRoot);
+    const temporaryPath = join(userTemporaryRoot, `${transferId}.part`);
+    assertContained(userTemporaryRoot, temporaryPath);
+    return { finalPath, temporaryPath };
+  }
+
+  async getUsage(user: PublicUser): Promise<StorageUsage> {
+    return this.calculateUsage(await this.ensureUserRoot(user.id), user);
+  }
+
+  async hasAvailableDiskSpace(requiredBytes: number): Promise<boolean> {
+    const stats = await statfs(this.root, { bigint: true });
+    const available = stats.bavail * stats.bsize;
+    return available >= BigInt(requiredBytes);
+  }
+
+  async commitTemporaryFile(temporaryPath: string, finalPath: string): Promise<void> {
+    assertContained(this.temporaryRoot, temporaryPath);
+    assertContained(this.usersRoot, finalPath);
+    await link(temporaryPath, finalPath);
+    await unlink(temporaryPath);
+    try {
+      const directoryHandle = await open(dirname(finalPath), "r");
+      try {
+        await directoryHandle.sync();
+      } finally {
+        await directoryHandle.close();
+      }
+    } catch {
+      // Directory fsync is not supported consistently on Windows; the file itself is fsynced before linking.
+    }
+  }
+
+  async removeTemporaryFile(temporaryPath: string): Promise<void> {
+    assertContained(this.temporaryRoot, temporaryPath);
+    await rm(temporaryPath, { force: true });
   }
 
   private async resolveExistingFromRoot(userRoot: string, components: string[]): Promise<string> {

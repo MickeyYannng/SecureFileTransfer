@@ -14,6 +14,9 @@ export interface RuntimeConfig {
   maxFileSizeBytes: number;
   defaultQuotaBytes: number;
   defaultMaxFiles: number;
+  uploadChunkSize: number;
+  maxActiveUploadsGlobal: number;
+  maxActiveUploadsPerUser: number;
 }
 
 export function loadRuntimeConfig(environment: NodeJS.ProcessEnv = process.env): RuntimeConfig {
@@ -28,6 +31,9 @@ export function loadRuntimeConfig(environment: NodeJS.ProcessEnv = process.env):
     maxFileSizeBytes: positiveInteger(environment.SFT_MAX_FILE_SIZE_BYTES, 512 * 1024 * 1024),
     defaultQuotaBytes: positiveInteger(environment.SFT_DEFAULT_QUOTA_BYTES, 1024 * 1024 * 1024),
     defaultMaxFiles: positiveInteger(environment.SFT_DEFAULT_MAX_FILES, 1_000),
+    uploadChunkSize: positiveInteger(environment.SFT_UPLOAD_CHUNK_SIZE, 256 * 1024),
+    maxActiveUploadsGlobal: positiveInteger(environment.SFT_MAX_ACTIVE_UPLOADS_GLOBAL, 32),
+    maxActiveUploadsPerUser: positiveInteger(environment.SFT_MAX_ACTIVE_UPLOADS_PER_USER, 1),
   };
 }
 

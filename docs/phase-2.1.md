@@ -33,7 +33,7 @@ Phase 2.1 已实现用户认证、SQLite 管理、WebSocket 会话认证、用�
 复制 `.env.example` 为被 Git 忽略的 `.env`，设置 `SFT_SEED_ALICE_PASSWORD` 和 `SFT_SEED_BOB_PASSWORD`，然后执行：
 
 ```powershell
-npm run db:init --workspace @sft/server -- --seed-test-users
+npm run db:seed --workspace @sft/server
 ```
 
 该操作幂等：已有同名用户不会被覆盖，也不会在控制台打印密码。删除数据库或用户属于高风险数据操作，不是初始化脚本的一部分。

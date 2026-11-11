@@ -1,6 +1,18 @@
 export const PROTOCOL_NAME = "SFTP-WS";
 export const PROTOCOL_VERSION = 1;
 export const MAX_CONTROL_MESSAGE_BYTES = 64 * 1024;
+export const BINARY_HEADER_LENGTH = 100;
+export const DEFAULT_UPLOAD_CHUNK_SIZE = 256 * 1024;
+export const MAX_BINARY_METADATA_BYTES = 8 * 1024;
+
+export const BINARY_MESSAGE_TYPES = {
+  uploadChunk: 0x0201,
+} as const;
+
+export const BINARY_FLAGS = {
+  ackRequired: 0x0001,
+  final: 0x0002,
+} as const;
 
 export const CONTROL_MESSAGE_TYPES = [
   "HELLO",
@@ -16,6 +28,14 @@ export const CONTROL_MESSAGE_TYPES = [
   "AUTH_ME_RESULT",
   "FILE_LIST_REQUEST",
   "FILE_LIST_RESULT",
+  "UPLOAD_INIT",
+  "UPLOAD_READY",
+  "UPLOAD_ACK",
+  "UPLOAD_FINISH",
+  "UPLOAD_COMPLETE",
+  "UPLOAD_ABORT",
+  "UPLOAD_ABORTED",
+  "UPLOAD_ERROR",
   "ERROR",
 ] as const;
 
@@ -105,6 +125,62 @@ export interface FileListResultPayload {
   usage: StorageUsage;
 }
 
+export interface UploadInitPayload {
+  path: string;
+  fileSize: number;
+  fileSha256: string;
+}
+
+export interface UploadReadyPayload {
+  transferId: string;
+  chunkSize: number;
+  nextOffset: number;
+}
+
+export interface UploadAckPayload {
+  transferId: string;
+  persistedOffset: number;
+  chunkLength: number;
+}
+
+export interface UploadFinishPayload {
+  transferId: string;
+}
+
+export interface UploadCompletePayload {
+  transferId: string;
+  path: string;
+  fileSize: number;
+  fileSha256: string;
+}
+
+export interface UploadAbortPayload {
+  transferId: string;
+}
+
+export interface UploadErrorPayload extends ErrorPayload {
+  transferId?: string;
+}
+
+export interface BinaryFrameHeader {
+  messageType: number;
+  flags: number;
+  errorCode: number;
+  requestId: string;
+  transferId: string;
+  fileSize: bigint;
+  offset: bigint;
+  payloadLength: number;
+  metadataLength: number;
+  payloadSha256: Uint8Array;
+}
+
+export interface ParsedBinaryFrame {
+  header: BinaryFrameHeader;
+  metadata: Uint8Array;
+  payload: Uint8Array;
+}
+
 export const ERROR_CODES = {
   invalidMessage: "1001_INVALID_MESSAGE",
   helloRequired: "1002_HELLO_REQUIRED",
@@ -118,7 +194,16 @@ export const ERROR_CODES = {
   sessionRevoked: "2005_SESSION_REVOKED",
   invalidPath: "3001_INVALID_PATH",
   notFound: "3004_NOT_FOUND",
+  fileExists: "3005_FILE_EXISTS",
+  hashMismatch: "3007_HASH_MISMATCH",
+  sizeMismatch: "3008_SIZE_MISMATCH",
+  invalidOffset: "3009_INVALID_OFFSET",
+  invalidChunk: "3010_INVALID_CHUNK",
+  uploadCancelled: "3011_UPLOAD_CANCELLED",
   rateLimited: "4001_RATE_LIMITED",
+  quotaExceeded: "4002_QUOTA_EXCEEDED",
+  tooManyTasks: "4003_TOO_MANY_TASKS",
+  insufficientStorage: "4004_INSUFFICIENT_STORAGE",
   internalError: "5001_INTERNAL_ERROR",
   notImplemented: "5002_NOT_IMPLEMENTED",
 } as const;
@@ -171,6 +256,98 @@ export function hasStringField<TField extends string>(
   field: TField,
 ): value is Record<TField, string> {
   return isRecord(value) && typeof value[field] === "string";
+}
+
+export function encodeBinaryFrame(
+  header: Omit<BinaryFrameHeader, "payloadLength" | "metadataLength">,
+  payload: Uint8Array,
+  metadata = new Uint8Array(),
+): Uint8Array {
+  if (metadata.byteLength > MAX_BINARY_METADATA_BYTES) throw new Error("binary metadata exceeds limit");
+  if (header.payloadSha256.byteLength !== 32) throw new Error("payload SHA-256 must be 32 bytes");
+  const totalLength = BINARY_HEADER_LENGTH + metadata.byteLength + payload.byteLength;
+  const bytes = new Uint8Array(totalLength);
+  const view = new DataView(bytes.buffer);
+  bytes.set(new TextEncoder().encode("SFT1"), 0);
+  view.setUint8(4, PROTOCOL_VERSION);
+  view.setUint8(5, BINARY_HEADER_LENGTH);
+  view.setUint16(6, header.messageType, false);
+  view.setUint16(8, header.flags, false);
+  view.setUint16(10, header.errorCode, false);
+  bytes.set(uuidToBytes(header.requestId), 12);
+  bytes.set(uuidToBytes(header.transferId), 28);
+  view.setBigUint64(44, header.fileSize, false);
+  view.setBigUint64(52, header.offset, false);
+  view.setUint32(60, payload.byteLength, false);
+  view.setUint32(64, metadata.byteLength, false);
+  bytes.set(header.payloadSha256, 68);
+  bytes.set(metadata, BINARY_HEADER_LENGTH);
+  bytes.set(payload, BINARY_HEADER_LENGTH + metadata.byteLength);
+  return bytes;
+}
+
+export function parseBinaryFrame(
+  input: ArrayBuffer | Uint8Array,
+  maxPayloadLength: number,
+): ParsedBinaryFrame {
+  const bytes = input instanceof Uint8Array ? input : new Uint8Array(input);
+  if (bytes.byteLength < BINARY_HEADER_LENGTH) throw new Error("binary frame is shorter than its header");
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (new TextDecoder().decode(bytes.subarray(0, 4)) !== "SFT1") throw new Error("invalid binary frame magic");
+  if (view.getUint8(4) !== PROTOCOL_VERSION) throw new Error("unsupported binary protocol version");
+  if (view.getUint8(5) !== BINARY_HEADER_LENGTH) throw new Error("unsupported binary header length");
+  const payloadLength = view.getUint32(60, false);
+  const metadataLength = view.getUint32(64, false);
+  if (payloadLength > maxPayloadLength) throw new Error("binary payload exceeds limit");
+  if (metadataLength > MAX_BINARY_METADATA_BYTES) throw new Error("binary metadata exceeds limit");
+  const expectedLength = BINARY_HEADER_LENGTH + metadataLength + payloadLength;
+  if (expectedLength !== bytes.byteLength) throw new Error("binary frame length does not match header");
+  const header: BinaryFrameHeader = {
+    messageType: view.getUint16(6, false),
+    flags: view.getUint16(8, false),
+    errorCode: view.getUint16(10, false),
+    requestId: bytesToUuid(bytes.subarray(12, 28)),
+    transferId: bytesToUuid(bytes.subarray(28, 44)),
+    fileSize: view.getBigUint64(44, false),
+    offset: view.getBigUint64(52, false),
+    payloadLength,
+    metadataLength,
+    payloadSha256: bytes.slice(68, 100),
+  };
+  return {
+    header,
+    metadata: bytes.subarray(BINARY_HEADER_LENGTH, BINARY_HEADER_LENGTH + metadataLength),
+    payload: bytes.subarray(BINARY_HEADER_LENGTH + metadataLength),
+  };
+}
+
+export function hexToBytes(hex: string): Uint8Array {
+  if (!/^[0-9a-f]{64}$/i.test(hex)) throw new Error("SHA-256 hex value is invalid");
+  const result = new Uint8Array(32);
+  for (let index = 0; index < result.length; index += 1) {
+    result[index] = Number.parseInt(hex.slice(index * 2, index * 2 + 2), 16);
+  }
+  return result;
+}
+
+export function bytesToHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+}
+
+function uuidToBytes(uuid: string): Uint8Array {
+  const compact = uuid.replaceAll("-", "");
+  if (!/^[0-9a-f]{32}$/i.test(compact)) throw new Error("binary frame UUID is invalid");
+  const bytes = new Uint8Array(16);
+  for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = Number.parseInt(compact.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+function bytesToUuid(bytes: Uint8Array): string {
+  if (bytes.byteLength !== 16) throw new Error("binary UUID must be 16 bytes");
+  const compact = Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("");
+  return `${compact.slice(0, 8)}-${compact.slice(8, 12)}-${compact.slice(12, 16)}-${compact.slice(16, 20)}-${compact.slice(20)}`;
 }
 
 function isIdentifier(value: string): boolean {

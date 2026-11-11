@@ -1,9 +1,14 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
+import { sha256 } from "@noble/hashes/sha2.js";
+import { bytesToHex as nobleBytesToHex } from "@noble/hashes/utils.js";
 import {
+  BINARY_FLAGS,
+  BINARY_MESSAGE_TYPES,
   ERROR_CODES,
   PROTOCOL_NAME,
   createControlMessage,
+  encodeBinaryFrame,
   hasStringField,
   parseControlMessage,
   serializeControlMessage,
@@ -14,6 +19,7 @@ import {
 
 type ConnectionStatus = "connecting" | "connected" | "disconnected" | "error";
 type AuthStatus = "unauthenticated" | "authenticating" | "authenticated";
+type UploadStatus = "idle" | "hashing" | "initializing" | "uploading" | "verifying" | "cancelling" | "completed" | "cancelled" | "error";
 
 const connectionStatus = ref<ConnectionStatus>("disconnected");
 const authStatus = ref<AuthStatus>("unauthenticated");
@@ -27,6 +33,16 @@ const loginForm = reactive({ username: "", password: "" });
 const currentPath = ref("");
 const fileEntries = ref<FileListEntry[]>([]);
 const storageUsage = ref<StorageUsage>();
+const selectedFile = ref<File>();
+const uploadStatus = ref<UploadStatus>("idle");
+const uploadProgress = ref(0);
+const uploadSpeed = ref(0);
+const uploadMessage = ref("请选择一个文件");
+const uploadTransferId = ref<string>();
+let uploadChunkSize = 256 * 1024;
+let uploadPersistedOffset = 0;
+let uploadStartedAt = 0;
+let uploadGeneration = 0;
 
 let socket: WebSocket | undefined;
 let sessionToken: string | undefined;
@@ -87,6 +103,9 @@ function connect(): void {
   });
 
   socket.addEventListener("close", () => {
+    if (["initializing", "uploading", "verifying", "cancelling"].includes(uploadStatus.value)) {
+      failUpload("连接中断；Phase 2.2 不支持断点续传，请重新上传");
+    }
     connectionStatus.value = "disconnected";
     authStatus.value = sessionToken ? "authenticating" : "unauthenticated";
     connectionId.value = "—";
@@ -153,7 +172,168 @@ function handleMessage(message: ReturnType<typeof parseControlMessage>): void {
     storageUsage.value = parseStorageUsage(payload.usage);
     return;
   }
+  if (message.type === "UPLOAD_READY") {
+    const payload = asRecord(message.payload);
+    uploadTransferId.value = readString(payload, "transferId");
+    uploadChunkSize = readNumber(payload, "chunkSize");
+    uploadPersistedOffset = readNumber(payload, "nextOffset");
+    uploadStartedAt = performance.now();
+    uploadStatus.value = "uploading";
+    uploadMessage.value = "服务器已创建临时文件，正在上传";
+    void sendNextUploadChunk(uploadGeneration);
+    return;
+  }
+  if (message.type === "UPLOAD_ACK") {
+    const payload = asRecord(message.payload);
+    if (readString(payload, "transferId") !== uploadTransferId.value) return;
+    const persistedOffset = readNumber(payload, "persistedOffset");
+    if (persistedOffset < uploadPersistedOffset || persistedOffset > (selectedFile.value?.size ?? 0)) {
+      failUpload("服务器返回了非法 ACK 偏移量");
+      return;
+    }
+    uploadPersistedOffset = persistedOffset;
+    updateUploadMetrics();
+    if (selectedFile.value && persistedOffset === selectedFile.value.size) {
+      uploadStatus.value = "verifying";
+      uploadMessage.value = "服务器正在校验整文件 SHA-256 并原子提交";
+      send("UPLOAD_FINISH", { transferId: uploadTransferId.value });
+    } else {
+      void sendNextUploadChunk(uploadGeneration);
+    }
+    return;
+  }
+  if (message.type === "UPLOAD_COMPLETE") {
+    uploadProgress.value = 100;
+    uploadStatus.value = "completed";
+    uploadMessage.value = "上传完成，文件已通过完整性校验";
+    uploadTransferId.value = undefined;
+    addLog("文件上传完成，WebSocket 连接保持正常");
+    refreshFiles();
+    return;
+  }
+  if (message.type === "UPLOAD_ABORTED") {
+    uploadStatus.value = "cancelled";
+    uploadMessage.value = "上传已取消，临时文件已清理";
+    uploadTransferId.value = undefined;
+    return;
+  }
+  if (message.type === "UPLOAD_ERROR") {
+    const payload = asRecord(message.payload);
+    const code = readString(payload, "code");
+    failUpload(`${code}：${readString(payload, "message")}`);
+    if (code.startsWith("200")) clearAuthentication();
+    return;
+  }
   if (message.type === "ERROR") handleServerError(message.payload);
+}
+
+function selectFile(event: Event): void {
+  const input = event.target as HTMLInputElement;
+  const file = input.files?.[0];
+  if (!file) return;
+  selectedFile.value = file;
+  resetUploadState();
+  uploadMessage.value = `${file.name} · ${formatBytes(file.size)}`;
+}
+
+async function startUpload(): Promise<void> {
+  const file = selectedFile.value;
+  if (!file || authStatus.value !== "authenticated" || connectionStatus.value !== "connected") return;
+  resetUploadState();
+  const generation = ++uploadGeneration;
+  uploadStatus.value = "hashing";
+  uploadMessage.value = "正在分块计算文件 SHA-256";
+  try {
+    const hasher = sha256.create();
+    const hashChunkSize = 1024 * 1024;
+    for (let offset = 0; offset < file.size; offset += hashChunkSize) {
+      if (generation !== uploadGeneration) return;
+      const chunk = new Uint8Array(await file.slice(offset, Math.min(file.size, offset + hashChunkSize)).arrayBuffer());
+      hasher.update(chunk);
+      uploadProgress.value = file.size === 0 ? 0 : Math.min(20, Math.round((offset + chunk.byteLength) / file.size * 20));
+      await nextBrowserTurn();
+    }
+    if (generation !== uploadGeneration) return;
+    const fileSha256 = nobleBytesToHex(hasher.digest());
+    const logicalPath = currentPath.value ? `${currentPath.value}/${file.name}` : file.name;
+    uploadStatus.value = "initializing";
+    uploadProgress.value = 0;
+    uploadMessage.value = "正在验证文件名、配额和服务器磁盘空间";
+    send("UPLOAD_INIT", { path: logicalPath, fileSize: file.size, fileSha256 });
+  } catch (error) {
+    failUpload(error instanceof Error ? error.message : "计算文件摘要失败");
+  }
+}
+
+async function sendNextUploadChunk(generation: number): Promise<void> {
+  const file = selectedFile.value;
+  const transferId = uploadTransferId.value;
+  if (!file || !transferId || generation !== uploadGeneration || uploadStatus.value !== "uploading") return;
+  if (uploadPersistedOffset === file.size) {
+    uploadStatus.value = "verifying";
+    send("UPLOAD_FINISH", { transferId });
+    return;
+  }
+  try {
+    const end = Math.min(file.size, uploadPersistedOffset + uploadChunkSize);
+    const payload = new Uint8Array(await file.slice(uploadPersistedOffset, end).arrayBuffer());
+    if (generation !== uploadGeneration) return;
+    const frame = encodeBinaryFrame({
+      messageType: BINARY_MESSAGE_TYPES.uploadChunk,
+      flags: BINARY_FLAGS.ackRequired,
+      errorCode: 0,
+      requestId: crypto.randomUUID(),
+      transferId,
+      fileSize: BigInt(file.size),
+      offset: BigInt(uploadPersistedOffset),
+      payloadSha256: sha256(payload),
+    }, payload);
+    if (socket?.readyState !== WebSocket.OPEN) throw new Error("WebSocket 已断开");
+    socket.send(frame);
+  } catch (error) {
+    failUpload(error instanceof Error ? error.message : "读取或发送文件分块失败");
+  }
+}
+
+function cancelUpload(): void {
+  uploadGeneration += 1;
+  if (uploadTransferId.value && socket?.readyState === WebSocket.OPEN) {
+    uploadStatus.value = "cancelling";
+    uploadMessage.value = "正在取消并清理服务器临时文件";
+    send("UPLOAD_ABORT", { transferId: uploadTransferId.value });
+  } else {
+    uploadStatus.value = "cancelled";
+    uploadMessage.value = "操作已取消";
+  }
+}
+
+function updateUploadMetrics(): void {
+  const fileSize = selectedFile.value?.size ?? 0;
+  uploadProgress.value = fileSize === 0 ? 100 : Math.round(uploadPersistedOffset / fileSize * 100);
+  const elapsedSeconds = Math.max((performance.now() - uploadStartedAt) / 1000, 0.001);
+  uploadSpeed.value = uploadPersistedOffset / elapsedSeconds;
+  uploadMessage.value = `${formatBytes(uploadPersistedOffset)} / ${formatBytes(fileSize)}`;
+}
+
+function resetUploadState(): void {
+  uploadGeneration += 1;
+  uploadStatus.value = "idle";
+  uploadProgress.value = 0;
+  uploadSpeed.value = 0;
+  uploadPersistedOffset = 0;
+  uploadTransferId.value = undefined;
+}
+
+function failUpload(message: string): void {
+  uploadGeneration += 1;
+  uploadStatus.value = "error";
+  uploadMessage.value = message;
+  uploadTransferId.value = undefined;
+  addLog(`上传失败：${message}`);
+}
+
+function nextBrowserTurn(): Promise<void> {
+  return new Promise((resolvePromise) => window.setTimeout(resolvePromise, 0));
 }
 
 function login(): void {
@@ -167,7 +347,10 @@ function login(): void {
 }
 
 function logout(): void {
-  if (authStatus.value === "authenticated") send("AUTH_LOGOUT", {});
+  if (authStatus.value === "authenticated") {
+    if (["hashing", "initializing", "uploading", "verifying"].includes(uploadStatus.value)) cancelUpload();
+    send("AUTH_LOGOUT", {});
+  }
 }
 
 function refreshFiles(): void {
@@ -227,6 +410,7 @@ function handleServerError(value: unknown): void {
 }
 
 function clearAuthentication(): void {
+  resetUploadState();
   sessionToken = undefined;
   currentUser.value = undefined;
   sessionExpiresAt.value = undefined;
@@ -323,7 +507,7 @@ onBeforeUnmount(disconnect);
 
     <section v-if="authStatus !== 'authenticated'" class="login-layout">
       <div class="login-copy">
-        <span class="phase-pill">Phase 2.1</span>
+        <span class="phase-pill">Phase 2.2</span>
         <h2>先验证身份，再访问私人空间</h2>
         <p>密码通过 WebSocket 自定义协议提交，服务端使用 Argon2id 验证；重连时必须重新验证短期会话令牌。</p>
       </div>
@@ -372,7 +556,38 @@ onBeforeUnmount(disconnect);
             <div><el-button :disabled="!currentPath" @click="goUp">返回上级</el-button><el-button type="primary" plain @click="refreshFiles">刷新</el-button></div>
           </div>
         </template>
-        <el-table :data="fileEntries" empty-text="私人目录为空；上传下载将在 Phase 2.2 实现" @row-dblclick="openDirectory">
+        <section class="upload-panel">
+          <div class="upload-picker">
+            <label class="file-picker-label">
+              <span>{{ selectedFile ? '重新选择文件' : '选择本地文件' }}</span>
+              <input type="file" :disabled="['hashing', 'initializing', 'uploading', 'verifying', 'cancelling'].includes(uploadStatus)" @change="selectFile" />
+            </label>
+            <div class="selected-file-copy">
+              <strong>{{ selectedFile?.name ?? '尚未选择文件' }}</strong>
+              <span>{{ selectedFile ? formatBytes(selectedFile.size) : '文件将上传到当前私人目录' }}</span>
+            </div>
+            <el-button
+              type="primary"
+              :disabled="!selectedFile || connectionStatus !== 'connected' || authStatus !== 'authenticated' || ['hashing', 'initializing', 'uploading', 'verifying', 'cancelling'].includes(uploadStatus)"
+              @click="startUpload"
+            >上传</el-button>
+            <el-button
+              v-if="['hashing', 'initializing', 'uploading', 'verifying'].includes(uploadStatus)"
+              type="danger"
+              plain
+              @click="cancelUpload"
+            >取消</el-button>
+          </div>
+          <div v-if="uploadStatus !== 'idle'" class="upload-progress-row">
+            <el-progress :percentage="uploadProgress" :status="uploadStatus === 'error' ? 'exception' : uploadStatus === 'completed' ? 'success' : undefined" />
+            <div class="upload-meta">
+              <span>{{ uploadMessage }}</span>
+              <span v-if="uploadSpeed > 0">{{ formatBytes(uploadSpeed) }}/s</span>
+              <el-tag size="small">{{ uploadStatus }}</el-tag>
+            </div>
+          </div>
+        </section>
+        <el-table :data="fileEntries" empty-text="私人目录为空；可在上方选择文件上传" @row-dblclick="openDirectory">
           <el-table-column label="名称" min-width="240">
             <template #default="scope"><span :class="{ 'directory-link': scope.row.type === 'directory' }">{{ scope.row.type === 'directory' ? '📁' : '📄' }} {{ scope.row.name }}</span></template>
           </el-table-column>

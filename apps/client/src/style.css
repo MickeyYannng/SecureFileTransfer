@@ -40,6 +40,15 @@ h2 { margin: 12px 0; font-size: clamp(28px, 4vw, 44px); line-height: 1.1; letter
 .quota-copy { margin-top: 16px; }
 .path-label { margin-left: 10px; color: #7c899b; font-family: Consolas, monospace; font-size: 13px; }
 .directory-link { color: #2362aa; font-weight: 700; cursor: pointer; }
+.upload-panel { margin: -4px 0 20px; padding: 18px; border: 1px solid #dfe8f1; border-radius: 12px; background: #f7faff; }
+.upload-picker { display: flex; align-items: center; gap: 12px; }
+.file-picker-label { position: relative; display: inline-flex; align-items: center; padding: 9px 14px; border: 1px solid #b8cbe0; border-radius: 8px; color: #2362aa; background: white; font-size: 14px; font-weight: 700; cursor: pointer; white-space: nowrap; }
+.file-picker-label input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+.selected-file-copy { min-width: 0; flex: 1; display: grid; gap: 3px; }
+.selected-file-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.selected-file-copy span, .upload-meta { color: #6b778a; font-size: 12px; }
+.upload-progress-row { margin-top: 16px; }
+.upload-meta { display: flex; align-items: center; gap: 14px; margin-top: 8px; }
 
 .connection-facts { display: flex; flex-wrap: wrap; gap: 10px 24px; color: #5f6d80; font-size: 13px; }
 details { margin-top: 16px; }
@@ -54,4 +63,6 @@ summary { cursor: pointer; color: #2362aa; font-weight: 700; }
   .login-layout, .dashboard-grid { grid-template-columns: 1fr; gap: 20px; }
   .login-layout { padding: 8px 0; }
   .card-header { align-items: flex-start; flex-direction: column; }
+  .upload-picker { align-items: stretch; flex-direction: column; }
+  .upload-meta { align-items: flex-start; flex-direction: column; gap: 6px; }
 }

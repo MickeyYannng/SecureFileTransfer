@@ -8,7 +8,9 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "db:init": "tsx src/init-database.ts",
-    "test": "npm run build && node --test dist/server.test.js"
+    "db:seed": "tsx src/init-database.ts --seed-test-users",
+    "test": "npm run build && node --test dist/server.test.js dist/upload.test.js",
+    "test:slow-upload": "npm run build && node --test dist/upload.slow.test.js"
   },
   "dependencies": {
     "@sft/protocol": "file:../../packages/protocol",

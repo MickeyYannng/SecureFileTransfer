@@ -1,4 +1,4 @@
-# 系统架构说明（Phase 1 基线）
+# 系统架构说明（更新至 Phase 2.2）
 
 ## 1. 技术选择与结论
 
@@ -23,7 +23,7 @@ flowchart LR
     GW --> AUDIT[结构化审计日志]
 ```
 
-Phase 2.1 已落地 UI、连接管理、共享控制协议、WebSocket 网关、认证/会话、SQLite 用户元数据和受限文件列表。传输任务管理、文件内容读写和 TLS 仍是后续阶段边界。
+Phase 2.2 已落地 UI、连接管理、共享控制/二进制协议、WebSocket 网关、认证/会话、SQLite 用户元数据、受限文件列表、单文件上传任务管理与流式文件写入。下载和 TLS 仍是后续阶段边界。
 
 ## 3. 运行时与目录边界
 
@@ -49,8 +49,9 @@ secure-file-transfer/
 - 一个浏览器会话维护一条 WebSocket 长连接，可在其上复用多个 `requestId` 和 `transferId`。
 - 服务端为每条连接维护独立的协商、认证、心跳、限流和任务状态；不同用户不能共享可变会话对象。
 - Node.js 事件循环处理大量连接，文件 IO 使用异步流；CPU 密集型摘要在流式读取时增量计算，必要时移至 worker pool。
-- 任务调度器按连接和用户同时限制并发数；WebSocket `bufferedAmount`/流背压超过水位时暂停磁盘读取。
-- 连接断开只使任务进入可恢复/失败状态，不以断开作为文件结束信号。
+- Phase 2.2 默认每个连接/用户只允许 1 个上传，服务器还有全局任务上限；初始化在进程内互斥区预留字节数、文件数和目标路径，防止并发绕过配额。
+- 客户端只保留一个未确认块，服务器写入并 `fsync` 后才 ACK，天然提供上传背压。
+- 连接断开会取消当前上传、释放预留并删除临时文件；不以断开作为文件结束信号。断点恢复留到 Phase 4。
 
 ## 5. 关键流程
 
@@ -73,21 +74,23 @@ sequenceDiagram
     end
 ```
 
-### Phase 2 上传目标流程（尚未实现）
+### Phase 2.2 单文件上传流程（已实现）
 
 ```mermaid
 sequenceDiagram
     participant C as Client
     participant S as Server
     C->>S: UPLOAD_INIT(path, size, sha256)
-    S-->>C: UPLOAD_ACCEPT(transferId, offset, chunkLimit)
+    S->>S: revalidate session + reserve quota/path
+    S-->>C: UPLOAD_READY(transferId, nextOffset=0, chunkSize)
     loop bounded chunks
-        C->>S: DATA(transferId, offset, length, chunkHash)
-        S-->>C: CHUNK_ACK(nextOffset)
+        C->>S: binary UPLOAD_CHUNK(100-byte header + payload)
+        S->>S: validate + positional write + fsync
+        S-->>C: UPLOAD_ACK(persistedOffset)
     end
     C->>S: UPLOAD_FINISH(totalHash)
     S->>S: fsync + size/hash check + atomic rename
-    S-->>C: TRANSFER_COMPLETE(size, sha256)
+    S-->>C: UPLOAD_COMPLETE(size, sha256)
     Note over C,S: WebSocket remains open
 ```
 
@@ -121,5 +124,14 @@ sequenceDiagram
 - `users` 保存 Argon2id PHC 哈希、公开用户资料和配额；`sessions` 保存随机 Token 的 SHA-256 查找值、有效期和撤销时间，不保存原始 Token。
 - 服务端连接只保存内部 `sessionId`。任何受保护操作都重新读取数据库，因而退出、过期或后台撤销会立即生效。
 - 存储布局为 `storage/users/<server-issued-uuid>/`。路径接口只接受 `/` 分隔的逻辑相对路径，拒绝绝对路径、反斜杠、`.`、`..`、NUL、Windows 保留名及符号链接/目录联接。
-- Phase 2.1 仅列举目录和计算配额用量；`resolveForCreate` 为 Phase 2.2 预留安全创建目标解析，但尚未开放上传入口。
+- Phase 2.2 上传复用受控创建路径接口；临时文件位于 `storage/.upload-tmp/<user-id>/`，不会出现在用户文件列表中。启动时清理上次进程异常退出留下的临时目录。
+
+## 10. Phase 2.2 持久写入和原子提交
+
+- 浏览器使用 `File.slice()` 增量计算整文件摘要并按默认 256 KiB 分块，服务端用 `FileHandle.write` 循环处理短写，不缓存完整文件。
+- 每块验证协议长度、任务归属、声明大小、严格顺序偏移和 SHA-256；成功写入并 `fsync` 后才返回 ACK。
+- 完成时再次核对累计字节、临时文件实际大小和整文件增量 SHA-256，然后关闭句柄。
+- Windows/Unix 均使用同卷硬链接创建最终文件，以原子且不覆盖的方式解决并发同名冲突；成功后删除临时链接，并尽力对目录执行 `fsync`。目标已存在则安全失败。
+- 错误摘要、大小不符、非法块、取消、会话失效或断线都会关闭句柄、删除临时文件并释放配额预留，不会产生可见残缺文件。
+- 配额预留和活跃任务表目前是单进程内状态；若未来部署多个服务实例，必须迁移到共享事务/租约存储后才能保证跨实例一致性。
 
