@@ -124,6 +124,37 @@ sequenceDiagram
     S-->>C: AUTH_LOGOUT_ACK
 ```
 
+### 3.3 公钥登录时序
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    C->>S: AUTH_KEY_CHALLENGE(username)
+    S-->>C: AUTH_KEY_CHALLENGE_RESULT(id, random challenge)
+    C->>C: Ed25519 sign with local private key
+    C->>S: AUTH_KEY_RESPONSE(id, signature)
+    S->>S: verify registered public key and consume challenge
+    S-->>C: AUTH_SUCCESS(session token)
+```
+
+### 3.4 心跳与文件列表时序
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    C->>S: HELLO(protocol v1)
+    S-->>C: HELLO_ACK(connectionId, heartbeat policy)
+    loop connection lifetime
+        S->>C: HEARTBEAT_PING(nonce)
+        C-->>S: HEARTBEAT_PONG(same nonce)
+    end
+    C->>S: FILE_LIST_REQUEST(relative path)
+    S->>S: recheck session and private directory
+    S-->>C: FILE_LIST_RESULT(entries, usage)
+```
+
 ## 4. 二进制数据帧固定头（网络字节序，大端）
 
 ```text

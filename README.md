@@ -54,7 +54,7 @@ npm run dev
 
 选择较大文件开始上传或下载，在任务列表点击“暂停”，再点击“继续”。上传恢复时客户端携带原 `transferId`，服务端返回已经持久化的 `nextOffset`；下载恢复时客户端携带已经确认并写入临时文件的 offset。完成后仍执行整文件 SHA-256 校验。
 
-上传暂停记录默认保留 10 分钟，可通过 `SFT_UPLOAD_RESUME_TTL_MS` 调整。Edge/Chrome 使用 OPFS 和 File System Access API 流式保存下载；其他浏览器使用最多 32 MiB 的内存兼容模式。
+上传暂停记录默认保留 10 分钟，可通过 `SFT_UPLOAD_RESUME_TTL_MS` 调整。当前续传适合演示“暂停、重连、继续”：上传暂停状态保存在服务器进程内，服务端重启后不可恢复；未主动暂停的异常断线会清理临时文件。下载暂停状态保存在当前浏览器页面内，刷新页面后不可恢复。Edge/Chrome 使用 OPFS 和 File System Access API 流式保存下载；其他浏览器使用最多 32 MiB 的内存兼容模式。
 
 ### Ed25519 公钥登录
 
@@ -75,6 +75,18 @@ SFT_VIP_BANDWIDTH_BPS=5242880
 ```
 
 限速在服务端上传写入和下载发送前执行，同一用户的并发任务共享额度。GUI 当前用户卡片显示普通/VIP 身份，任务列表显示实时速度。
+
+## Docker 演示部署
+
+先按上文生成证书并填写 `.env` 的测试密码。Docker Desktop 启动后执行：
+
+```powershell
+docker compose build
+docker compose run --rm sft npm run db:seed --workspace @sft/server
+docker compose up -d
+```
+
+访问 <https://127.0.0.1:3443>。容器内由同一个 Node 服务提供前端静态页面、HTTPS 和 WSS；`data/`、`storage/` 挂载到 E 盘项目目录，`certs/` 只读挂载。Docker 版本和 Windows 原生 `npm run dev` 可以分别运行；不要同时占用同一套数据库执行初始化。停止：`docker compose down`（不会删除挂载的数据）。
 
 ## 构建与测试
 

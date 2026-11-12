@@ -2,6 +2,8 @@ import { randomUUID } from "node:crypto";
 import { createServer, type Server as HttpServer } from "node:http";
 import { createServer as createHttpsServer, type Server as HttpsServer } from "node:https";
 import { fileURLToPath } from "node:url";
+import { existsSync } from "node:fs";
+import { resolve } from "node:path";
 import express from "express";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import {
@@ -166,6 +168,11 @@ export async function startServer(options: ServerOptions = {}): Promise<RunningS
 
   const app = express();
   app.disable("x-powered-by");
+  const clientDist = fileURLToPath(new URL("../../client/dist/", import.meta.url));
+  if (existsSync(resolve(clientDist, "index.html"))) {
+    app.use(express.static(clientDist));
+    app.get("/", (_request, response) => response.sendFile(resolve(clientDist, "index.html")));
+  }
   app.get("/health", (_request, response) => {
     response.json({ status: "ok", protocol: PROTOCOL_NAME, version: PROTOCOL_VERSION, phase: "complete" });
   });

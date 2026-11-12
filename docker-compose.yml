@@ -1,0 +1,20 @@
+services:
+  sft:
+    build: .
+    ports:
+      - "3443:3000"
+    env_file:
+      - .env
+    environment:
+      SFT_HOST: 0.0.0.0
+      SFT_PORT: 3000
+      SFT_REQUIRE_TLS: "true"
+      SFT_ALLOWED_ORIGINS: https://127.0.0.1:3443,https://localhost:3443
+      SFT_DATABASE_PATH: /app/data/sft.sqlite
+      SFT_STORAGE_ROOT: /app/storage
+      SFT_TLS_CERT_PATH: /app/certs/dev-server.pem
+      SFT_TLS_KEY_PATH: /app/certs/dev-server-key.pem
+    volumes:
+      - ./data:/app/data
+      - ./storage:/app/storage
+      - ./certs:/app/certs:ro
