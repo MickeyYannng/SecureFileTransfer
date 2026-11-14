@@ -101,14 +101,4 @@ npm run test:slow-download --workspace @sft/server
 
 自动化测试覆盖协议头、认证、会话、目录隔离、上传下载、续传、公钥正确/错误签名、普通/VIP 速度差异、WSS 证书与 Origin、多用户及三文件并发。
 
-## 建议课程演示顺序
-
-1. 展示 HTTPS 证书和 WSS 连接、心跳状态。
-2. Alice、Bob 分别登录，展示私人目录互不可见。
-3. 批量上传 3 个文件，再并发下载并核对 SHA-256。
-4. 传输大文件时暂停并继续，展示 offset 与最终完整性。
-5. Alice 生成密钥、退出后使用 Ed25519 私钥登录，并用错误私钥演示拒绝。
-6. Alice 与 Bob 传输相同大文件，对比普通用户和 VIP 速度。
-7. 演示路径穿越、错误密码限流或非法 Origin 被拒绝。
-
 协议头、状态机和时序图见 [协议说明](docs/protocol-draft.md)，系统边界见 [架构说明](docs/architecture.md)，PPT 要求覆盖见 [需求清单](docs/requirements.md)。
